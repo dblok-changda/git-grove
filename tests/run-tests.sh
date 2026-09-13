@@ -23,6 +23,7 @@ bad()     { fail=$((fail + 1)); printf '  FAIL  %s\n' "$*"; }
 section() { printf '\n%s\n' "$*"; }
 
 # Report lines look like:  "  <sym> <CLASS>    <name>"  (worktrees: "<path>  [<branch>|detached]")
+# shellcheck disable=SC2016  # awk programs below use $2/$NF/$0 literally
 class_of_branch()   { awk -v n="$2" '$NF == n && $2 ~ /^[A-Z_]+$/ { print $2; exit }' "$1"; }
 class_of_worktree() { awk -v n="$2" 'index($0, "/" n "  [") && $2 ~ /^[A-Z_]+$/ { print $2; exit }' "$1"; }
 check_branch()   { local got; got=$(class_of_branch "$1" "$3");   if [[ $got == "$2" ]]; then ok "$2  $3"; else bad "expected $2 for $3, got ${got:-nothing}"; fi; }
@@ -34,7 +35,14 @@ check_held()     { if awk -v n="$2" '$0 ~ ("^  [^ ]+ " n "$") { h = NR } h && NR
 check_offered()  { if awk -v n="$2" '$0 ~ ("^  [^ ]+ " n "$") { h = NR } h && NR > h && NR <= h + 2 && /keeping/ { f = 1 } END { exit f }' "$1" && grep -qE -- "^  [^ ]+ $2\$" "$1"; then ok "offered $2"; else bad "expected $2 to be offered"; fi; }
 check_present()  { if [[ -e $1 ]]; then ok "kept     ${1#"$FX"/}"; else bad "MISSING  ${1#"$FX"/}"; fi; }
 check_gone()     { if [[ -e $1 ]]; then bad "still present ${1#"$FX"/}"; else ok "removed  ${1#"$FX"/}"; fi; }
-check_ref()      { if git -C "$FX/work" rev-parse -q --verify "$2" >/dev/null 2>&1; then [[ $1 == present ]] && ok "ref kept    $2" || bad "ref still present $2"; else [[ $1 == gone ]] && ok "ref removed $2" || bad "ref MISSING $2"; fi; }
+check_ref() {
+  local exists=0; git -C "$FX/work" rev-parse -q --verify "$2" >/dev/null 2>&1 && exists=1
+  if [[ $1 == present ]]; then
+    if [[ $exists -eq 1 ]]; then ok "ref kept    $2"; else bad "ref MISSING $2"; fi
+  else
+    if [[ $exists -eq 1 ]]; then bad "ref still present $2"; else ok "ref removed $2"; fi
+  fi
+}
 
 build()  { "$HERE/make-fixture.sh" "$1" >/dev/null 2>&1 || { echo "fixture build failed"; exit 1; }; }
 run_gc() { ( cd "$FX/work" && PATH="$FX/bin:$PATH" "$BASH_BIN" "$GC" "$@" --no-color ); }
@@ -55,13 +63,13 @@ for spec in \
   "SAFE wt/clean-merged" "SAFE wt/stale" "SAFE wt/ignored-generated" "IN_USE wt/dirty" "IN_USE wt/rebasing" \
   "IN_USE wt/untracked" "IN_USE wt/sensitive" "IN_USE wt/ignored-other" "IN_USE wt/locked" \
   "SAFE origin/tmp/remote-merged" "REVIEW origin/tmp/remote-deleted"; do
-  check_branch "$WORK/t1.txt" ${spec%% *} "${spec#* }"
+  check_branch "$WORK/t1.txt" "${spec%% *}" "${spec#* }"
 done
 for spec in \
   "PROTECTED work" "SAFE wt clean merged" "SAFE wt-detached" "SAFE wt-ignored-generated" "DIRTY wt-dirty" "DIRTY wt-staged" \
   "REVIEW wt-untracked" "REVIEW wt-sensitive" "REVIEW wt-ignored-other" "IN_USE wt-locked" "IN_USE wt-rebasing" \
   "STALE wt-stale" "REVIEW wt-stale-detached"; do
-  check_worktree "$WORK/t1.txt" ${spec%% *} "${spec#* }"
+  check_worktree "$WORK/t1.txt" "${spec%% *}" "${spec#* }"
 done
 for f in .DS_Store src/.DS_Store 'notes\.txt~' 'old\.swp' 'scratch\.tmp'; do check_offered "$WORK/t1.txt" "$f"; done
 for f in '\.env~' '\.env\.swp' 'recent\.swp'; do check_held "$WORK/t1.txt" "$f"; done
@@ -76,7 +84,7 @@ check_grep   "$WORK/t1.txt" 'stash\(es\) exist' "stash listed"
 check_grep   "$WORK/t1.txt" 'No changes have been made' "dry-run footer"
 check_ref present refs/remotes/origin/tmp/remote-merged
 check_ref present refs/remotes/origin/tmp/remote-deleted
-[[ -d $FX/wt-untracked && -f $FX/.env~ || -f $FX/work/.env~ ]] && ok "dry run left files alone" || bad "dry run changed files"
+if [[ -d $FX/wt-untracked && -f $FX/work/.env~ ]]; then ok "dry run left files alone"; else bad "dry run changed files"; fi
 
 # ---------------------------------------------------------------------------
 section "T2  dry run without --fetch: PR-based decisions must downgrade"
@@ -118,15 +126,15 @@ else
   for b in feature/squashed feature/pr-behind feature/pr-dropped feature/rebased experiment/unmerged local/only develop release/1.0 wt/rebasing; do check_ref present "refs/heads/$b"; done
   check_ref gone    refs/remotes/origin/tmp/remote-merged
   check_ref present refs/remotes/origin/tmp/remote-deleted
-  git -C "$FX/work" worktree list --porcelain | grep -q 'wt-stale-detached' && ok "stale detached entry kept" || bad "stale detached entry removed"
-  [[ $(git -C "$FX/work" stash list | wc -l) -eq 1 ]] && ok "stash untouched" || bad "stash changed"
+  if git -C "$FX/work" worktree list --porcelain | grep -q 'wt-stale-detached'; then ok "stale detached entry kept"; else bad "stale detached entry removed"; fi
+  if [[ $(git -C "$FX/work" stash list | wc -l) -eq 1 ]]; then ok "stash untouched"; else bad "stash changed"; fi
   check_grep "$FX/work/.git/git-cleanup.log" 'branch-deleted name=feature/merged .*restore: git branch feature/merged' "recovery log written"
 
   section "T5  interactive --apply: revalidation skip, one force delete accepted"
   FX=$WORK/t5; build "$FX"
   ( cd "$FX/work" && WORK_REPO=$FX/work PATH="$FX/bin:$PATH" expect -f "$HERE/interactive.exp" ) > "$WORK/t5.txt" 2>&1 || bad "expect exit status $?"
   check_grep "$WORK/t5.txt" 'Removing branch fix/merged-ff .*skipped \(tip changed since the audit' "branch changed after audit was skipped"
-  [[ $(git -C "$FX/work" log -1 --format=%s fix/merged-ff 2>/dev/null) == "late commit" ]] && ok "late commit preserved" || bad "late commit lost"
+  if [[ $(git -C "$FX/work" log -1 --format=%s fix/merged-ff 2>/dev/null) == "late commit" ]]; then ok "late commit preserved"; else bad "late commit lost"; fi
   check_ref gone    refs/heads/feature/squashed
   check_ref present refs/heads/feature/pr-behind
   check_gone    "$FX/work/node_modules"

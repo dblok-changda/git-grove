@@ -47,6 +47,7 @@ check_ref() {
 build()  { "$HERE/make-fixture.sh" "$1" >/dev/null 2>&1 || { echo "fixture build failed"; exit 1; }; }
 run_gc() { ( cd "$FX/work" && PATH="$FX/bin:$PATH" "$BASH_BIN" "$GC" "$@" --no-color ); }
 
+# shellcheck disable=SC2016  # $BASH_VERSION is expanded by the bash under test, not this one
 printf 'git-cleanup self-test\n  script: %s\n  bash:   %s (%s)\n  git:    %s\n' "$GC" "$BASH_BIN" "$("$BASH_BIN" -c 'echo $BASH_VERSION')" "$(git --version)"
 
 # ---------------------------------------------------------------------------

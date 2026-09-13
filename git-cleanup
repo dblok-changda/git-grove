@@ -1,0 +1,1497 @@
+#!/usr/bin/env bash
+#
+# git-cleanup — safely audit and (only on request) remove merged local branches,
+# obsolete worktrees, stale remote-tracking refs and disposable temp files.
+#
+#   git-cleanup                 audit only (default — changes nothing)
+#   git-cleanup --verbose       audit + the evidence behind every decision
+#   git-cleanup --apply         audit, then interactive cleanup of SAFE items
+#   git-cleanup --apply --yes   same, but skip the batch prompt for SAFE items
+#
+# Guiding rule: uncertain = preserve. Every destructive action is re-validated
+# immediately before it runs and is skipped if anything changed since the audit.
+#
+# Requires bash 3.2+ and git 2.31+. Optional: gh (GitHub CLI) to recognise
+# squash/rebase-merged pull requests.
+
+set -u
+set -o pipefail
+
+readonly VERSION="1.0.0"
+readonly RULE="────────────────────────────────────────"
+readonly SEP=$'\x1f'   # field separator for git plumbing output (never appears in ref names)
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+APPLY=0; YES=0; FETCH=0; VERBOSE=0; TEMP=0; GENERATED=0; USE_GH=1; COLOR_MODE=auto
+REMOTE_OPT=""; DEFAULT_OPT=""; GH_REPO_OPT=""
+PROTECTED=(main master develop development staging production trunk 'release/*' 'hotfix/*')
+
+# Generated directories are only ever *listed*, and only removed with a per-item
+# confirmation, and only when git itself says the directory is ignored.
+GENERATED_NAMES=(node_modules dist build coverage .terraform .cache .parcel-cache .next .nuxt .turbo __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .gradle target)
+
+# Ignored files inside a worktree that look like secrets/state. A worktree holding
+# any of these is never removed automatically (git worktree remove deletes ignored files).
+SENSITIVE_RE='(^|/)(\.env|\.env\.[^/]*|\.envrc|[^/]*\.(pem|key|p12|pfx|jks|keystore|tfvars|sqlite|sqlite3|db)|[^/]*\.tfstate(\.backup)?|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*credentials[^/]*|\.netrc|\.npmrc|\.pypirc|secrets?(\.[^/]*)?|[^/]*\.secret)$'
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+REPO_ROOT=""; GIT_COMMON_DIR=""; CWD_TOPLEVEL=""; CURRENT_BRANCH=""
+REMOTE=""; REMOTE_URL=""; DEFAULT_BRANCH=""; DEFAULT_REF=""; DEFAULT_REF_FULL=""; DEFAULT_SOURCE=""
+FETCH_STATUS=""; FETCH_OK=0; GH_STATUS=""; GH_REPO=""; GH_OK=0; LOG_FILE=""
+
+# Stale remote-tracking refs (remote branch gone; local ref still present)
+R_REF=(); R_SHA=(); R_CLASS=(); R_REASON=()
+
+# Branch table (parallel arrays, indexed by branch number)
+B_NAME=(); B_SHA=(); B_UP=(); B_TRACK=(); B_WT=(); B_MCLASS=(); B_MREASON=()
+B_CLASS=(); B_REASON=(); B_EVID=(); B_UNIQUE=(); B_PRNUM=(); B_PRHEAD=(); B_PRMERGE=()
+
+# Worktree table
+W_PATH=(); W_HEAD=(); W_BRANCH=(); W_KIND=(); W_DETACHED=(); W_LOCKED=(); W_PRUNABLE=(); W_OP=(); W_OPBRANCH=()
+W_EXISTS=(); W_STATUS_OK=(); W_STAGED=(); W_MODIFIED=(); W_UNTRACKED=(); W_IGNORED=()
+W_SENSITIVE=(); W_SENSITIVE_EXAMPLES=(); W_OTHER=(); W_OTHER_EXAMPLES=(); W_CLASS=(); W_REASON=(); W_EVID=()
+
+# Temp files / generated dirs / stashes
+T_PATH=(); T_RULE=(); T_CLASS=(); T_NOTE=(); T_TRACKED_SKIPPED=()
+G_PATH=(); G_SIZE=(); G_CLASS=(); G_NOTE=(); G_SKIPPED=()
+S_LIST=()
+
+# Cleanup plan
+P_KIND=(); P_IDX=(); P_LABEL=(); P_CONFIRM=()
+ACTIONS_DONE=0; WORKTREES_REMOVED=0
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+Usage: git-cleanup [options]
+
+Audit local branches, worktrees, remote-tracking refs and temp files, then report
+what is safe to remove and why. DRY RUN by default: nothing is deleted without --apply.
+
+Modes
+  (none)            Audit only. Print the report. Change nothing.
+  --apply           After the audit, show the plan, confirm, and clean up SAFE items.
+                    Anything that needs a force delete is confirmed one item at a time.
+  --yes             With --apply: skip the batch confirmation for items that passed
+                    every SAFE check. Never skips per-item confirmation for force
+                    deletes or generated directories, and never relaxes any check.
+
+Analysis
+  --fetch           Run `git fetch <remote>` first so decisions reflect the current remote
+                    state. Nothing is pruned: stale remote-tracking refs are audited one by
+                    one and only removed under --apply when their commits are safe elsewhere.
+  --no-gh           Do not consult the GitHub CLI for merged pull requests.
+  --temp            Scan for disposable temp files (.DS_Store, *.swp, *.swo, *~, *.tmp).
+                    Tracked files are always excluded, whatever their name.
+  --generated       List ignored generated directories (node_modules, dist, build, ...).
+                    Listed only; removal needs --apply plus a per-item confirmation.
+  --protected PAT   Add a protected branch glob (repeatable, or comma-separated).
+                    Defaults: main master develop development staging production trunk
+                    release/* hotfix/*   plus `git config --get-all cleanup.protected`.
+  --remote NAME     Remote to evaluate against (default: origin, or the only remote).
+  --gh-repo SLUG    GitHub repository for PR lookups ([HOST/]OWNER/REPO) when it cannot be
+                    derived from the remote URL.
+  --default BRANCH  Override default-branch detection.
+
+Output
+  -v, --verbose     Show the evidence behind every decision.
+  --no-color        Disable colour (the NO_COLOR environment variable is also honoured).
+  -h, --help        Show this help.
+  --version         Show the version.
+
+Classifications
+  SAFE        Git proves the branch tip is already contained in the default branch
+              (git merge-base --is-ancestor). Removed with `git branch -d`, which
+              performs Git's own safety check again. Worktrees: clean + branch SAFE.
+  SAFE_PR     The ancestry test fails (squash/rebase merge) but a MERGED pull request
+              was found whose head is the local tip (or contains it) AND whose merge commit
+              is reachable from the freshly fetched default branch. Requires --fetch.
+              Removal needs `git branch -D`, so each one is confirmed individually.
+  STALE       Worktree entry whose directory no longer exists and whose commits are held
+              by a branch (`git worktree remove` on that entry). A stale detached HEAD that
+              no branch contains is REVIEW instead.
+  REVIEW      Might be removable, but safety cannot be proven. Never touched.
+  UNMERGED    Has commits that are not in the default branch. Never touched.
+  DIRTY       Worktree with uncommitted changes. Never touched.
+  IN_USE      Current branch, or checked out in a worktree that stays. Never touched.
+  PROTECTED   Default branch or matches a protected pattern. Never touched.
+  UNKNOWN     A check failed. Never touched.
+
+Never deleted by this tool: stashes, .env* files, credentials, keys, certificates,
+Terraform state, databases, config files, or any untracked/ignored file it was not
+explicitly told about. `git clean` is never run. `-d` never silently becomes `-D`.
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+setup_colors() {
+  if [[ $COLOR_MODE == never || -n ${NO_COLOR:-} || ! -t 1 ]]; then
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+  else
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+  fi
+}
+
+title()  { printf '\n%s%s%s\n%s\n' "$C_BOLD" "$*" "$C_RESET" "$RULE"; }
+kv()     { printf '  %-20s%s\n' "$1" "$2"; }
+ok()     { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()   { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+bad()    { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; }
+note()   { printf '  %s•%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+detail() { printf '    %s\n' "$*"; }
+die()    { printf 'git-cleanup: %s\n' "$*" >&2; exit 1; }
+
+# Print multi-line evidence, dimmed, only in --verbose mode.
+evidence() {
+  [[ $VERBOSE -eq 1 ]] || return 0
+  local line
+  while IFS= read -r line; do
+    [[ -n $line ]] && printf '    %s%s%s\n' "$C_DIM" "$line" "$C_RESET"
+  done <<< "$1"
+}
+
+# Symbol + coloured class tag + name, followed by reason and verdict lines.
+print_item() {
+  local class=$1 name=$2 reason=$3 evid=$4 verdict=$5 sym color
+  case $class in
+    SAFE|SAFE_PR|STALE) sym="✓"; color=$C_GREEN ;;
+    PROTECTED)          sym="•"; color=$C_DIM ;;
+    *)                  sym="!"; color=$C_YELLOW ;;
+  esac
+  printf '  %s%s%s %s%-9s%s %s\n' "$color" "$sym" "$C_RESET" "$color" "$class" "$C_RESET" "$name"
+  [[ -n $reason ]] && detail "$reason"
+  evidence "$evid"
+  [[ -n $verdict ]] && detail "$verdict"
+  printf '\n'
+}
+
+verdict_for() {
+  case $1 in
+    SAFE)    printf 'Safe to remove (%s)' "$2" ;;
+    SAFE_PR) printf 'Safe to remove after explicit confirmation (%s)' "$2" ;;
+    STALE)   printf 'Safe to remove the stale entry (git worktree remove)' ;;
+    REVIEW)  printf 'Needs your review — keeping' ;;
+    *)       printf 'Keeping' ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Small git helpers
+# ---------------------------------------------------------------------------
+ref_exists()  { git show-ref --verify --quiet -- "$1"; }
+is_ancestor() { git merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
+have_commit() { git cat-file -e "$1^{commit}" 2>/dev/null; }
+count_range() { git rev-list --count "$1" 2>/dev/null || printf '?'; }
+short_sha()   { printf '%s' "${1:0:10}"; }
+trim()        { local s=$1; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+# Resolve a directory to its physical path (portable; no readlink -f on macOS).
+physical_path() { (cd -- "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+
+# Does $1 match any protected glob? Prints the pattern on success.
+protected_pattern_for() {
+  local b=$1 p
+  for p in "${PROTECTED[@]}"; do
+    # shellcheck disable=SC2053  # unquoted RHS is intentional: glob match
+    if [[ $b == $p ]]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# If any *directory* component of path $1 is a known generated-dir name, print the
+# shortest prefix ending there (e.g. packages/a/node_modules). The filename itself is ignored.
+generated_dir_prefix() {
+  local rest=$1 acc="" comp n
+  while [[ $rest == */* ]]; do
+    comp=${rest%%/*}; rest=${rest#*/}
+    acc=${acc:+$acc/}$comp
+    for n in "${GENERATED_NAMES[@]}"; do
+      [[ $comp == "$n" ]] && { printf '%s' "$acc"; return 0; }
+    done
+  done
+  return 1
+}
+
+temp_rule_for() {
+  case $1 in
+    .DS_Store)   printf 'macOS Finder metadata (.DS_Store)' ;;
+    *.swp|*.swo) printf 'Vim swap file (*.swp, *.swo)' ;;
+    *~)          printf 'editor backup file (*~)' ;;
+    *.tmp)       printf 'temporary file (*.tmp)' ;;
+    *)           return 1 ;;
+  esac
+}
+
+# A swap/backup/tmp copy of a sensitive file (.env~, .env.swp, credentials.tmp) holds its contents.
+looks_sensitive_temp() {
+  local b=$1
+  case $b in *.swp|*.swo|*.tmp) b=${b%.*} ;; *~) b=${b%\~} ;; esac
+  [[ $b =~ $SENSITIVE_RE || ${b#.} =~ $SENSITIVE_RE ]]
+}
+
+# Print up to three sensitive-looking files under directory $1 (absolute), nothing if none.
+sensitive_files_under() {
+  find "$1" -type f 2>/dev/null | grep -E -- "$SENSITIVE_RE" | head -n 3 | sed "s#^$1/##" | paste -sd, - | sed 's/,/, /g'
+}
+
+add_protected() {
+  local parts p
+  IFS=, read -r -a parts <<< "$1"
+  for p in ${parts[@]+"${parts[@]}"}; do
+    p=$(trim "$p"); [[ -n $p ]] && PROTECTED+=("$p")
+  done
+}
+
+# Is there a terminal we can ask questions on? (-r /dev/tty only checks permission bits.)
+tty_available() {
+  [[ -t 0 ]] && return 0
+  { : < /dev/tty; } 2>/dev/null
+}
+
+# Ask a yes/no question on the terminal. Returns 0=yes, 1=no, 2=no terminal.
+ask() {
+  local prompt=$1 ans=""
+  tty_available || return 2
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" ans || return 1
+  else
+    read -r -p "$prompt" ans < /dev/tty || return 1
+  fi
+  [[ $ans =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+log_action() {
+  [[ -n $LOG_FILE ]] || return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+on_interrupt() {
+  printf '\n\n%sInterrupted.%s No further changes will be made.\n' "$C_YELLOW" "$C_RESET"
+  if [[ $ACTIONS_DONE -gt 0 ]]; then
+    printf 'Actions already completed (%d) are recorded in %s\n' "$ACTIONS_DONE" "$LOG_FILE"
+  fi
+  exit 130
+}
+
+# ---------------------------------------------------------------------------
+# Phase 1: repository state
+# ---------------------------------------------------------------------------
+detect_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a Git repository."
+
+  if [[ $(git rev-parse --is-bare-repository 2>/dev/null) == true ]]; then
+    CWD_TOPLEVEL=""
+  else
+    CWD_TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || die "cannot determine the work tree root."
+    CWD_TOPLEVEL=$(physical_path "$CWD_TOPLEVEL")
+    CURRENT_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  fi
+
+  GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || GIT_COMMON_DIR=$(physical_path "$(git rev-parse --git-common-dir)")
+  LOG_FILE="$GIT_COMMON_DIR/git-cleanup.log"
+
+  # The primary worktree is always the first entry of `git worktree list`.
+  local first
+  first=$(git worktree list --porcelain 2>/dev/null | head -n 1)
+  REPO_ROOT="${first#worktree }"
+  [[ -n $REPO_ROOT ]] || die "cannot determine the primary worktree."
+  REPO_ROOT=$(physical_path "$REPO_ROOT")
+  cd -- "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
+
+  # Repo-configured protected patterns: git config cleanup.protected <glob>
+  local p
+  while IFS= read -r p; do
+    [[ -n $p ]] && add_protected "$p"
+  done < <(git config --get-all cleanup.protected 2>/dev/null || true)
+}
+
+detect_remote() {
+  local remotes=() r
+  while IFS= read -r r; do [[ -n $r ]] && remotes+=("$r"); done < <(git remote 2>/dev/null)
+
+  if [[ -n $REMOTE_OPT ]]; then
+    git remote get-url "$REMOTE_OPT" >/dev/null 2>&1 || die "remote '$REMOTE_OPT' does not exist."
+    REMOTE=$REMOTE_OPT
+  elif [[ ${#remotes[@]} -eq 0 ]]; then
+    REMOTE=""
+  elif [[ ${#remotes[@]} -eq 1 ]]; then
+    REMOTE=${remotes[0]}
+  else
+    for r in "${remotes[@]}"; do [[ $r == origin ]] && REMOTE=origin; done
+    [[ -n $REMOTE ]] || die "several remotes and none is 'origin' (${remotes[*]}); pass --remote NAME."
+  fi
+  [[ -n $REMOTE ]] && REMOTE_URL=$(git remote get-url "$REMOTE" 2>/dev/null || true)
+  return 0
+}
+
+# Prefer <remote>/HEAD; fall back carefully; refuse to guess when ambiguous.
+detect_default_branch() {
+  local sym cand found=()
+
+  if [[ -n $DEFAULT_OPT ]]; then
+    DEFAULT_BRANCH=$DEFAULT_OPT; DEFAULT_SOURCE="--default"
+  elif [[ -n $REMOTE ]] && sym=$(git symbolic-ref --quiet --short "refs/remotes/$REMOTE/HEAD" 2>/dev/null); then
+    DEFAULT_BRANCH=${sym#"$REMOTE/"}; DEFAULT_SOURCE="$REMOTE/HEAD"
+  else
+    if [[ -n $REMOTE ]]; then
+      for cand in main master trunk; do
+        ref_exists "refs/remotes/$REMOTE/$cand" && found+=("$cand")
+      done
+    fi
+    if [[ ${#found[@]} -eq 0 ]]; then
+      for cand in main master trunk; do
+        ref_exists "refs/heads/$cand" && found+=("$cand")
+      done
+      DEFAULT_SOURCE="fallback: local branch (no remote-tracking ref found)"
+    else
+      DEFAULT_SOURCE="fallback: remote branch exists ($REMOTE/HEAD is unset; run --fetch or 'git remote set-head $REMOTE --auto')"
+    fi
+    case ${#found[@]} in
+      0) die "unable to determine the default branch safely; pass --default BRANCH." ;;
+      1) DEFAULT_BRANCH=${found[0]} ;;
+      *) die "ambiguous default branch (${found[*]}); pass --default BRANCH." ;;
+    esac
+  fi
+
+  # Compare against the remote-tracking ref when it exists (that is what "merged" means
+  # for a shared repository); otherwise against the local default branch.
+  if [[ -n $REMOTE ]] && ref_exists "refs/remotes/$REMOTE/$DEFAULT_BRANCH"; then
+    DEFAULT_REF="$REMOTE/$DEFAULT_BRANCH"; DEFAULT_REF_FULL="refs/remotes/$REMOTE/$DEFAULT_BRANCH"
+  elif ref_exists "refs/heads/$DEFAULT_BRANCH"; then
+    DEFAULT_REF="$DEFAULT_BRANCH"; DEFAULT_REF_FULL="refs/heads/$DEFAULT_BRANCH"
+    [[ -n $REMOTE ]] && DEFAULT_SOURCE="$DEFAULT_SOURCE; using LOCAL $DEFAULT_BRANCH (no $REMOTE/$DEFAULT_BRANCH)"
+  else
+    die "default branch '$DEFAULT_BRANCH' exists neither locally nor on $REMOTE."
+  fi
+}
+
+refresh_remotes() {
+  if [[ -z $REMOTE ]]; then
+    FETCH_STATUS="no remote configured"; return 0
+  fi
+  if [[ $FETCH -eq 0 ]]; then
+    FETCH_STATUS="skipped (pass --fetch to refresh remote state and audit stale remote-tracking refs)"; return 0
+  fi
+  local out rc line ref sha
+  # A plain fetch only. fetch.prune is forced off so a user config cannot turn this into a
+  # deletion; stale refs are audited individually and removed only under --apply.
+  out=$(git -c fetch.prune=false -c fetch.pruneTags=false fetch "$REMOTE" 2>&1); rc=$?
+  if [[ $rc -ne 0 ]]; then
+    FETCH_STATUS="FAILED — continuing with existing remote-tracking refs"
+    [[ $VERBOSE -eq 1 ]] && printf '%s\n' "$out" >&2
+    return 0
+  fi
+  FETCH_OK=1
+  FETCH_STATUS="fetched $REMOTE (nothing pruned; stale refs are audited below)"
+  # If <remote>/HEAD was never set, setting it is harmless local metadata and makes
+  # default-branch detection reliable.
+  if ! git symbolic-ref --quiet "refs/remotes/$REMOTE/HEAD" >/dev/null 2>&1; then
+    git remote set-head "$REMOTE" --auto >/dev/null 2>&1 && FETCH_STATUS="$FETCH_STATUS; set $REMOTE/HEAD"
+  fi
+  # Which remote-tracking refs point at branches the remote no longer has? Read-only.
+  while IFS= read -r line; do
+    case $line in
+      *"[would prune]"*)
+        ref=$(trim "${line##*\[would prune\] }")
+        sha=$(git rev-parse --verify --quiet "refs/remotes/$ref" 2>/dev/null) || continue
+        R_REF+=("$ref"); R_SHA+=("$sha"); R_CLASS+=(""); R_REASON+=("") ;;
+    esac
+  done < <(git remote prune --dry-run "$REMOTE" 2>/dev/null)
+  return 0
+}
+
+# Decisions that `git branch -d` does not double-check (force deletes, worktree removals,
+# stale-ref removals) are only allowed against remote state fetched in this run.
+remote_state_is_fresh() { [[ -z $REMOTE || $FETCH_OK -eq 1 ]]; }
+
+local_branch_containing() {
+  git for-each-ref --contains "$1" --format='%(refname:short)' refs/heads 2>/dev/null | head -n 1
+}
+
+# Is detached commit $1 held by something that will survive? Prints the holder description.
+# A local branch always counts; the default branch counts only when fetched in this run.
+detached_head_holder() {
+  local h
+  h=$(local_branch_containing "$1")
+  if [[ -n $h ]]; then printf 'local branch %s' "$h"; return 0; fi
+  if remote_state_is_fresh && is_ancestor "$1" "$DEFAULT_REF_FULL"; then printf '%s (fetched in this run)' "$DEFAULT_REF"; return 0; fi
+  return 1
+}
+
+remote_ref_is_stale() {
+  local i
+  for ((i = 0; i < ${#R_REF[@]}; i++)); do [[ ${R_REF[i]} == "$1" ]] && return 0; done
+  return 1
+}
+
+# Print a non-stale ref that still contains commit $1, if any.
+containing_ref_for() {
+  local r
+  while IFS= read -r r; do
+    [[ -n $r ]] || continue
+    remote_ref_is_stale "$r" && continue
+    printf '%s' "$r"; return 0
+  done < <(git for-each-ref --contains "$1" --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
+  return 1
+}
+
+# A stale remote-tracking ref may be removed only when its commits survive elsewhere.
+analyze_stale_remote_refs() {
+  local i ref sha keeper n
+  for ((i = 0; i < ${#R_REF[@]}; i++)); do
+    ref=${R_REF[i]}; sha=${R_SHA[i]}
+    if is_ancestor "$sha" "$DEFAULT_REF_FULL"; then
+      R_CLASS[i]=SAFE; R_REASON[i]="remote branch was deleted; its commits are in $DEFAULT_REF"
+    elif keeper=$(containing_ref_for "$sha"); then
+      R_CLASS[i]=SAFE; R_REASON[i]="remote branch was deleted; its commits are still reachable from $keeper"
+    else
+      n=$(git rev-list --count "$sha" "^$DEFAULT_REF_FULL" 2>/dev/null || printf '?')
+      R_CLASS[i]=REVIEW
+      R_REASON[i]="remote branch was deleted, but $n commit(s) are reachable only through this ref; removing it would orphan them. Keep them first with: git branch keep/${ref#"$REMOTE"/} $sha"
+    fi
+  done
+}
+
+# Turn a remote URL into [HOST/]OWNER/REPO for gh.
+repo_slug_from_url() {
+  local url=$1 host path
+  local re_url='^(https?|ssh|git)://([^@/]+@)?([^/:]+)(:[0-9]+)?/(.+)$'
+  local re_scp='^([^@/]+@)?([^:/]+):(.+)$'
+  if [[ $url =~ $re_url ]]; then host=${BASH_REMATCH[3]}; path=${BASH_REMATCH[5]}
+  elif [[ $url =~ $re_scp ]]; then host=${BASH_REMATCH[2]}; path=${BASH_REMATCH[3]}
+  else return 1; fi
+  path=${path%/}; path=${path%.git}
+  [[ $path == */* ]] || return 1
+  if [[ $host == github.com ]]; then printf '%s' "$path"; else printf '%s/%s' "$host" "$path"; fi
+}
+
+detect_gh() {
+  GH_OK=0
+  if [[ $USE_GH -eq 0 ]]; then GH_STATUS="disabled (--no-gh)"; return 0; fi
+  if ! command -v gh >/dev/null 2>&1; then GH_STATUS="gh not installed — squash/rebase-merged PRs cannot be recognised"; return 0; fi
+  if [[ -z $REMOTE ]]; then GH_STATUS="no remote to query"; return 0; fi
+  local slug
+  if [[ -n $GH_REPO_OPT ]]; then
+    slug=$GH_REPO_OPT
+  elif ! slug=$(repo_slug_from_url "$REMOTE_URL"); then
+    GH_STATUS="remote URL not recognised as a GitHub repository (pass --gh-repo OWNER/REPO)"; return 0
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    GH_STATUS="gh is not authenticated (run: gh auth login)"; return 0
+  fi
+  if ! gh repo view "$slug" --json nameWithOwner -q .nameWithOwner >/dev/null 2>&1; then
+    GH_STATUS="gh cannot access $slug"; return 0
+  fi
+  GH_REPO=$slug; GH_OK=1
+  GH_STATUS="available — $slug (used to recognise squash/rebase-merged pull requests)"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2: worktrees (collected first: branch decisions depend on where they are checked out)
+# ---------------------------------------------------------------------------
+add_worktree() {
+  local path=$1 head=$2 branch=$3 detached=$4 bare=$5 locked=$6 prunable=$7 kind
+  kind=linked; [[ ${#W_PATH[@]} -eq 0 ]] && kind=primary
+  [[ $bare -eq 1 ]] && kind=bare
+  local ppath=$path; [[ -d $path ]] && ppath=$(physical_path "$path")
+  W_PATH+=("$ppath"); W_HEAD+=("$head"); W_BRANCH+=("$branch"); W_KIND+=("$kind")
+  W_DETACHED+=("$detached"); W_LOCKED+=("$locked"); W_PRUNABLE+=("$prunable"); W_OP+=(""); W_OPBRANCH+=("")
+  if [[ -d $path ]]; then W_EXISTS+=(1); else W_EXISTS+=(0); fi
+  W_STATUS_OK+=(0); W_STAGED+=(0); W_MODIFIED+=(0); W_UNTRACKED+=(0); W_IGNORED+=(0)
+  W_SENSITIVE+=(0); W_SENSITIVE_EXAMPLES+=(""); W_OTHER+=(0); W_OTHER_EXAMPLES+=(""); W_CLASS+=(""); W_REASON+=(""); W_EVID+=("")
+}
+
+collect_worktrees() {
+  local line path="" head="" branch="" detached=0 bare=0 locked="" prunable=""
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      "worktree "*)  path=${line#worktree } ;;
+      "HEAD "*)      head=${line#HEAD } ;;
+      "branch "*)    branch=${line#branch }; branch=${branch#refs/heads/} ;;
+      detached)      detached=1 ;;
+      bare)          bare=1 ;;
+      locked)        locked="locked" ;;
+      "locked "*)    locked=${line#locked } ;;
+      prunable)      prunable="prunable" ;;
+      "prunable "*)  prunable=${line#prunable } ;;
+      "")
+        [[ -n $path ]] && add_worktree "$path" "$head" "$branch" "$detached" "$bare" "$locked" "$prunable"
+        path=""; head=""; branch=""; detached=0; bare=0; locked=""; prunable="" ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  [[ -n $path ]] && add_worktree "$path" "$head" "$branch" "$detached" "$bare" "$locked" "$prunable"
+
+  local i
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ ${W_KIND[i]} == linked && ${W_EXISTS[i]} -eq 1 ]] && inspect_worktree_status "$i"
+  done
+}
+
+# Fill the status columns for worktree $1 using porcelain status (never parses human output).
+inspect_worktree_status() {
+  local i=$1 p=${W_PATH[$1]} out line x y staged=0 modified=0 untracked=0 ignored=0 sensitive=0 examples=""
+  if ! out=$(git -C "$p" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null); then
+    W_STATUS_OK[i]=0; return 0
+  fi
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    x=${line:0:1}; y=${line:1:1}
+    if [[ $x == '?' ]]; then untracked=$((untracked + 1)); continue; fi
+    [[ $x == '!' ]] && continue
+    [[ $x != ' ' ]] && staged=$((staged + 1))
+    [[ $y != ' ' ]] && modified=$((modified + 1))
+  done <<< "$out"
+
+  # Ignored files are deleted along with the worktree by `git worktree remove`. Only
+  # recognised build output (generated dirs) and temp-pattern files may be lost silently;
+  # anything resembling secrets/state, and any other ignored file, blocks removal.
+  local f other=0 other_examples="" hit
+  while IFS= read -r -d '' f; do
+    [[ -z $f ]] && continue
+    ignored=$((ignored + 1))
+    if generated_dir_prefix "$f" >/dev/null; then
+      if [[ $f == */ ]]; then
+        hit=$(sensitive_files_under "$p/${f%/}")
+        [[ -n $hit ]] && { sensitive=$((sensitive + 1)); [[ $sensitive -le 3 ]] && examples="${examples:+$examples, }$f{$hit}"; }
+      elif [[ $f =~ $SENSITIVE_RE ]]; then
+        sensitive=$((sensitive + 1)); [[ $sensitive -le 3 ]] && examples="${examples:+$examples, }$f"
+      fi
+      continue
+    fi
+    if [[ $f != */ ]] && [[ $f =~ $SENSITIVE_RE ]]; then
+      sensitive=$((sensitive + 1)); [[ $sensitive -le 3 ]] && examples="${examples:+$examples, }$f"; continue
+    fi
+    if [[ $f != */ ]] && temp_rule_for "${f##*/}" >/dev/null && ! looks_sensitive_temp "${f##*/}"; then
+      continue
+    fi
+    other=$((other + 1)); [[ $other -le 3 ]] && other_examples="${other_examples:+$other_examples, }$f"
+  done < <(git -C "$p" ls-files --others --ignored --exclude-standard --directory -z 2>/dev/null)
+
+  # A rebase, merge, cherry-pick, revert or bisect in progress leaves a clean tree but
+  # state that `git worktree remove` would destroy.
+  local gp op=""
+  gp=$(git -C "$p" rev-parse --path-format=absolute --git-path . 2>/dev/null); gp=${gp%/.}
+  if [[ -n $gp ]]; then
+    [[ -d $gp/rebase-merge || -d $gp/rebase-apply ]] && op="rebase"
+    [[ -f $gp/MERGE_HEAD ]] && op="merge"
+    [[ -f $gp/CHERRY_PICK_HEAD ]] && op="cherry-pick"
+    [[ -f $gp/REVERT_HEAD ]] && op="revert"
+    [[ -f $gp/BISECT_LOG ]] && op="bisect"
+  fi
+  W_OP[i]=$op
+  # A rebase/bisect detaches HEAD, so the branch it operates on no longer shows as checked
+  # out. Record it: that branch is in use for as long as the operation lasts.
+  local opb=""
+  if [[ $op == rebase ]]; then
+    [[ -f $gp/rebase-merge/head-name ]] && opb=$(head -n 1 "$gp/rebase-merge/head-name" 2>/dev/null)
+    [[ -z $opb && -f $gp/rebase-apply/head-name ]] && opb=$(head -n 1 "$gp/rebase-apply/head-name" 2>/dev/null)
+  elif [[ $op == bisect && -f $gp/BISECT_START ]]; then
+    opb=$(head -n 1 "$gp/BISECT_START" 2>/dev/null)
+  fi
+  opb=${opb#refs/heads/}
+  W_OPBRANCH[i]=$opb
+
+  W_STATUS_OK[i]=1; W_STAGED[i]=$staged; W_MODIFIED[i]=$modified; W_UNTRACKED[i]=$untracked
+  W_IGNORED[i]=$ignored; W_SENSITIVE[i]=$sensitive; W_SENSITIVE_EXAMPLES[i]=$examples
+  W_OTHER[i]=$other; W_OTHER_EXAMPLES[i]=$other_examples
+}
+
+# A linked worktree has the *shape* of a removable one: exists, unlocked, not where we
+# run from, no staged/modified/untracked files, no sensitive ignored files.
+worktree_is_clean_shape() {
+  local i=$1
+  [[ ${W_KIND[i]} == linked ]] || return 1
+  [[ ${W_EXISTS[i]} -eq 1 && -z ${W_PRUNABLE[i]} && -z ${W_LOCKED[i]} ]] || return 1
+  [[ ${W_PATH[i]} != "$CWD_TOPLEVEL" ]] || return 1
+  [[ ${W_STATUS_OK[i]} -eq 1 && -z ${W_OP[i]} ]] || return 1
+  [[ ${W_STAGED[i]} -eq 0 && ${W_MODIFIED[i]} -eq 0 && ${W_UNTRACKED[i]} -eq 0 ]] || return 1
+  [[ ${W_SENSITIVE[i]} -eq 0 && ${W_OTHER[i]} -eq 0 ]]
+}
+
+# Is physical path $1 still one of the registered worktrees?
+worktree_registered() {
+  local line
+  while IFS= read -r line; do
+    case $line in "worktree "*) [[ $(physical_path "${line#worktree }") == "$1" ]] && return 0 ;; esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  return 1
+}
+
+worktree_index_for_branch() {
+  local b=$1 i
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ ${W_BRANCH[i]} == "$b" ]] && { printf '%s' "$i"; return 0; }
+  done
+  printf '%s' "-1"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3: branches
+# ---------------------------------------------------------------------------
+collect_branches() {
+  local name sha up track
+  while IFS="$SEP" read -r name sha up track; do
+    [[ -n $name ]] || continue
+    B_NAME+=("$name"); B_SHA+=("$sha"); B_UP+=("$up"); B_TRACK+=("$track")
+    B_WT+=("-1"); B_MCLASS+=(""); B_MREASON+=(""); B_CLASS+=(""); B_REASON+=("")
+    B_EVID+=(""); B_UNIQUE+=(0); B_PRNUM+=(""); B_PRHEAD+=(""); B_PRMERGE+=("")
+  done < <(git for-each-ref refs/heads \
+             --format="%(refname:lstrip=2)${SEP}%(objectname)${SEP}%(upstream:short)${SEP}%(upstream:track,nobracket)" 2>/dev/null)
+}
+
+branch_index_for() {
+  local b=$1 i
+  for ((i = 0; i < ${#B_NAME[@]}; i++)); do
+    [[ ${B_NAME[i]} == "$b" ]] && { printf '%s' "$i"; return 0; }
+  done
+  printf '%s' "-1"
+}
+
+# Merged PRs for a branch head, one per line: number \t headOid \t mergedAt \t base \t url \t mergeOid
+gh_merged_prs() {
+  gh pr list -R "$GH_REPO" --head "$1" --state merged --limit 20 \
+    --json number,headRefOid,mergedAt,baseRefName,url,mergeCommit \
+    --jq '.[] | [ (.number|tostring), .headRefOid, .mergedAt, .baseRefName, .url, (.mergeCommit.oid // "") ] | join("\t")' 2>/dev/null
+}
+
+# Squash/rebase support. Sets B_MCLASS to SAFE_PR or REVIEW, or leaves it empty (undecided).
+# SAFE_PR needs all of: PR state MERGED; local tip equals (or is contained in) the PR head;
+# the PR's merge commit present locally and reachable from the default branch; and remote
+# state fetched in this run, so an undone merge (force push) cannot masquerade as merged.
+evaluate_prs() {
+  local i=$1 name=${B_NAME[$1]} sha=${B_SHA[$1]}
+  local prs rc num head merged base url mergeoid n base_note
+  local exact_reason="" ancestor_reason="" review_reason="" chosen_merge=""
+
+  prs=$(gh_merged_prs "$name"); rc=$?
+  if [[ $rc -ne 0 ]]; then
+    B_EVID[i]="${B_EVID[i]}"$'\n'"GitHub: PR lookup failed (network or permissions); treated as no PR found"
+    return 0
+  fi
+  [[ -n $prs ]] || { B_EVID[i]="${B_EVID[i]}"$'\n'"GitHub: no merged pull request with head '$name'"; return 0; }
+
+  while IFS=$'\t' read -r num head merged base url mergeoid; do
+    [[ -n $num ]] || continue
+    B_EVID[i]="${B_EVID[i]}"$'\n'"GitHub: PR #$num MERGED ${merged%%T*} into $base, head $(short_sha "$head"), merge commit $(short_sha "$mergeoid") — $url"
+
+    if [[ -z $mergeoid ]]; then
+      review_reason="PR #$num is MERGED but GitHub reported no merge commit; cannot verify the merge reached $DEFAULT_REF"; continue
+    fi
+    if ! have_commit "$mergeoid"; then
+      review_reason="PR #$num was merged, but its merge commit $(short_sha "$mergeoid") is not available locally — run with --fetch"; continue
+    fi
+    if ! is_ancestor "$mergeoid" "$DEFAULT_REF_FULL"; then
+      review_reason="PR #$num was merged into '$base', but its merge commit $(short_sha "$mergeoid") is not reachable from $DEFAULT_REF (merge undone, or $DEFAULT_REF stale)"; continue
+    fi
+    base_note=""
+    [[ $base != "$DEFAULT_BRANCH" ]] && base_note="; merged into $base, whose merge commit has reached $DEFAULT_REF"
+
+    if [[ $head == "$sha" ]]; then
+      exact_reason="PR #$num merged (${merged%%T*}); local tip $(short_sha "$sha") is exactly the PR head; merge commit $(short_sha "$mergeoid") is in $DEFAULT_REF$base_note"
+      B_PRNUM[i]=$num; B_PRHEAD[i]=$head; chosen_merge=$mergeoid
+      break
+    elif have_commit "$head"; then
+      if is_ancestor "$sha" "$head"; then
+        if [[ -z $ancestor_reason ]]; then
+          ancestor_reason="PR #$num merged (${merged%%T*}); local tip $(short_sha "$sha") is an ancestor of the PR head $(short_sha "$head") — no local commits beyond the PR; merge commit $(short_sha "$mergeoid") is in $DEFAULT_REF$base_note"
+          B_PRNUM[i]=$num; B_PRHEAD[i]=$head; chosen_merge=$mergeoid
+        fi
+      elif is_ancestor "$head" "$sha"; then
+        n=$(count_range "$head..$sha")
+        review_reason="PR #$num was merged, but $n local commit(s) were added after its head $(short_sha "$head")"
+      else
+        review_reason="PR #$num was merged, but its head $(short_sha "$head") and the local tip $(short_sha "$sha") have diverged"
+      fi
+    else
+      review_reason="PR #$num was merged, but its head $(short_sha "$head") is not available locally to compare (try --fetch)"
+    fi
+  done <<< "$prs"
+
+  if [[ -n $exact_reason ]]; then
+    B_MCLASS[i]=SAFE_PR; B_MREASON[i]=$exact_reason; B_PRMERGE[i]=$chosen_merge
+  elif [[ -n $ancestor_reason ]]; then
+    B_MCLASS[i]=SAFE_PR; B_MREASON[i]=$ancestor_reason; B_PRMERGE[i]=$chosen_merge
+  elif [[ -n $review_reason ]]; then
+    B_MCLASS[i]=REVIEW; B_MREASON[i]=$review_reason
+  fi
+  if [[ ${B_MCLASS[i]} == SAFE_PR ]] && ! remote_state_is_fresh; then
+    B_MCLASS[i]=REVIEW
+    B_MREASON[i]="${B_MREASON[i]}. Re-run with --fetch so this can be verified against the current $DEFAULT_REF before any force delete"
+  fi
+  return 0
+}
+
+# All commits patch-equivalent to something already in the default branch? (rebase-merge hint)
+cherry_all_equivalent() {
+  local out plus
+  out=$(git cherry "$DEFAULT_REF_FULL" "$1" 2>/dev/null) || return 1
+  [[ -n $out ]] || return 1
+  plus=$(printf '%s\n' "$out" | grep -c '^+') || true
+  [[ ${plus:-1} -eq 0 ]]
+}
+
+# Merge status independent of where the branch is checked out. Sets B_MCLASS/B_MREASON.
+classify_merge() {
+  local i=$1 name=${B_NAME[$1]} sha=${B_SHA[$1]} up=${B_UP[$1]} track=${B_TRACK[$1]} unique
+
+  if ! git rev-parse --verify --quiet "$sha^{commit}" >/dev/null 2>&1; then
+    B_MCLASS[i]=UNKNOWN; B_MREASON[i]="tip $sha is not a valid commit"; return 0
+  fi
+
+  local gone=0
+  [[ $track == gone ]] && gone=1
+  [[ -n $up ]] && remote_ref_is_stale "$up" && gone=1
+
+  B_EVID[i]="tip $sha"
+  if [[ -n $up ]]; then
+    if [[ $gone -eq 1 ]]; then
+      B_EVID[i]="${B_EVID[i]}"$'\n'"upstream $up no longer exists on the remote"
+    else
+      B_EVID[i]="${B_EVID[i]}"$'\n'"upstream $up${track:+ ($track)}"
+    fi
+  else
+    B_EVID[i]="${B_EVID[i]}"$'\n'"no upstream configured"
+  fi
+
+  if is_ancestor "$sha" "$DEFAULT_REF_FULL"; then
+    B_MCLASS[i]=SAFE; B_MREASON[i]="fully merged into $DEFAULT_REF"
+    B_EVID[i]="${B_EVID[i]}"$'\n'"git merge-base --is-ancestor $name $DEFAULT_REF → yes"
+    return 0
+  fi
+  B_EVID[i]="${B_EVID[i]}"$'\n'"git merge-base --is-ancestor $name $DEFAULT_REF → no"
+
+  unique=$(count_range "$DEFAULT_REF_FULL..$sha"); B_UNIQUE[i]=$unique
+  B_EVID[i]="${B_EVID[i]}"$'\n'"$unique commit(s) in $name are not in $DEFAULT_REF"
+
+  if [[ $GH_OK -eq 1 ]]; then
+    evaluate_prs "$i"
+    [[ -n ${B_MCLASS[i]} ]] && return 0
+  fi
+
+  if cherry_all_equivalent "$sha"; then
+    B_MCLASS[i]=REVIEW
+    B_MREASON[i]="$unique commit(s) not in $DEFAULT_REF, but every one is patch-equivalent to a commit already there (git cherry) — probably rebase-merged; verify manually"
+    return 0
+  fi
+  if [[ $gone -eq 1 ]]; then
+    B_MCLASS[i]=REVIEW
+    B_MREASON[i]="upstream $up was deleted but $unique unique commit(s) remain — possibly squash-merged; cannot prove it"
+    return 0
+  fi
+  B_MCLASS[i]=UNMERGED; B_MREASON[i]="$unique commit(s) not in $DEFAULT_REF"
+}
+
+analyze_branches() {
+  local i name pat wi wpath
+  for ((i = 0; i < ${#B_NAME[@]}; i++)); do
+    name=${B_NAME[i]}
+    wi=$(worktree_index_for_branch "$name"); B_WT[i]=$wi
+
+    if [[ -n $CURRENT_BRANCH && $name == "$CURRENT_BRANCH" ]]; then
+      B_CLASS[i]=IN_USE; B_REASON[i]="currently checked out here ($CWD_TOPLEVEL)"; continue
+    fi
+    if [[ $name == "$DEFAULT_BRANCH" ]]; then
+      B_CLASS[i]=PROTECTED; B_REASON[i]="default branch"; continue
+    fi
+    if pat=$(protected_pattern_for "$name"); then
+      B_CLASS[i]=PROTECTED; B_REASON[i]="matches protected pattern '$pat'"; continue
+    fi
+    local oi opbusy=""
+    for ((oi = 0; oi < ${#W_PATH[@]}; oi++)); do
+      [[ -n ${W_OPBRANCH[oi]} && ${W_OPBRANCH[oi]} == "$name" ]] && { opbusy="a ${W_OP[oi]} of this branch is in progress in ${W_PATH[oi]}"; break; }
+    done
+    if [[ -n $opbusy ]]; then
+      B_CLASS[i]=IN_USE; B_REASON[i]=$opbusy; continue
+    fi
+
+    classify_merge "$i"
+
+    if [[ $wi -ge 0 ]]; then
+      wpath=${W_PATH[wi]}
+      if [[ ${W_KIND[wi]} != linked ]]; then
+        B_CLASS[i]=IN_USE; B_REASON[i]="checked out in the primary worktree ($wpath)"
+      elif [[ -n ${W_PRUNABLE[wi]} || ${W_EXISTS[wi]} -eq 0 ]] && [[ ${B_MCLASS[i]} == SAFE || ${B_MCLASS[i]} == SAFE_PR ]]; then
+        # Its worktree directory is gone; only metadata remains and is pruned before branches.
+        B_CLASS[i]=${B_MCLASS[i]}
+        B_REASON[i]="${B_MREASON[i]}; its worktree $wpath no longer exists on disk (stale metadata is pruned first)"
+      elif worktree_is_clean_shape "$wi" && [[ ${B_MCLASS[i]} == SAFE || ${B_MCLASS[i]} == SAFE_PR ]]; then
+        B_CLASS[i]=${B_MCLASS[i]}
+        B_REASON[i]="${B_MREASON[i]}; checked out in $wpath, which is clean and will be removed first"
+      else
+        B_CLASS[i]=IN_USE
+        B_REASON[i]="checked out in $wpath"
+        [[ ${W_EXISTS[wi]} -eq 0 ]] && B_REASON[i]="${B_REASON[i]} (directory missing; stale metadata)"
+        [[ ${W_STAGED[wi]} -gt 0 || ${W_MODIFIED[wi]} -gt 0 ]] && B_REASON[i]="${B_REASON[i]} (which has uncommitted changes)"
+        [[ ${W_UNTRACKED[wi]} -gt 0 ]] && B_REASON[i]="${B_REASON[i]} (which has untracked files)"
+        [[ ${W_SENSITIVE[wi]} -gt 0 || ${W_OTHER[wi]} -gt 0 ]] && B_REASON[i]="${B_REASON[i]} (which has ignored files that need review)"
+        [[ -n ${W_OP[wi]} ]] && B_REASON[i]="${B_REASON[i]} (where a ${W_OP[wi]} is in progress)"
+        [[ ${B_MCLASS[i]} != SAFE && ${B_MCLASS[i]} != SAFE_PR ]] && B_REASON[i]="${B_REASON[i]}; ${B_MREASON[i]}"
+      fi
+      continue
+    fi
+    B_CLASS[i]=${B_MCLASS[i]}; B_REASON[i]=${B_MREASON[i]}
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4: worktree classification (needs branch merge status)
+# ---------------------------------------------------------------------------
+analyze_worktrees() {
+  local i p b bi ev
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    p=${W_PATH[i]}; b=${W_BRANCH[i]}; ev="HEAD ${W_HEAD[i]}"
+    [[ -n $b ]] && ev="$ev"$'\n'"branch $b"
+
+    if [[ ${W_KIND[i]} == primary ]]; then
+      W_CLASS[i]=PROTECTED; W_REASON[i]="primary worktree"; W_EVID[i]=$ev; continue
+    fi
+    if [[ ${W_KIND[i]} == bare ]]; then
+      W_CLASS[i]=PROTECTED; W_REASON[i]="bare repository"; W_EVID[i]=$ev; continue
+    fi
+    if [[ -n ${W_PRUNABLE[i]} || ${W_EXISTS[i]} -eq 0 ]]; then
+      local holder
+      if [[ -n $b ]]; then
+        W_CLASS[i]=STALE; W_REASON[i]="directory is missing (${W_PRUNABLE[i]:-not on disk}); only metadata remains and branch $b keeps the commits"
+      elif holder=$(detached_head_holder "${W_HEAD[i]}"); then
+        W_CLASS[i]=STALE; W_REASON[i]="directory is missing; detached HEAD $(short_sha "${W_HEAD[i]}") is contained in $holder"
+      elif is_ancestor "${W_HEAD[i]}" "$DEFAULT_REF_FULL"; then
+        W_CLASS[i]=REVIEW; W_REASON[i]="directory is missing; detached HEAD $(short_sha "${W_HEAD[i]}") is in $DEFAULT_REF as last fetched — re-run with --fetch to confirm before removing the entry"
+      else
+        W_CLASS[i]=REVIEW
+        W_REASON[i]="directory is missing and detached HEAD $(short_sha "${W_HEAD[i]}") is not reachable from any branch; removing the entry would orphan those commits. Keep them first with: git branch keep/${p##*/} ${W_HEAD[i]}"
+      fi
+      W_EVID[i]=$ev; continue
+    fi
+    if [[ $p == "$CWD_TOPLEVEL" ]]; then
+      W_CLASS[i]=IN_USE; W_REASON[i]="you are running git-cleanup from this worktree"; W_EVID[i]=$ev; continue
+    fi
+    if [[ -n ${W_LOCKED[i]} ]]; then
+      W_CLASS[i]=IN_USE; W_REASON[i]="locked (${W_LOCKED[i]})"; W_EVID[i]=$ev; continue
+    fi
+    if [[ ${W_STATUS_OK[i]} -eq 0 ]]; then
+      W_CLASS[i]=UNKNOWN; W_REASON[i]="could not read its status"; W_EVID[i]=$ev; continue
+    fi
+    if [[ -n ${W_OP[i]} ]]; then
+      W_CLASS[i]=IN_USE; W_REASON[i]="a ${W_OP[i]} is in progress; removing it would destroy that state"; W_EVID[i]=$ev; continue
+    fi
+
+    ev="$ev"$'\n'"status: ${W_STAGED[i]} staged, ${W_MODIFIED[i]} modified, ${W_UNTRACKED[i]} untracked, ${W_IGNORED[i]} ignored entries"
+    if [[ ${W_STAGED[i]} -gt 0 || ${W_MODIFIED[i]} -gt 0 ]]; then
+      W_CLASS[i]=DIRTY; W_REASON[i]="${W_MODIFIED[i]} modified and ${W_STAGED[i]} staged file(s)"; W_EVID[i]=$ev; continue
+    fi
+    if [[ ${W_UNTRACKED[i]} -gt 0 ]]; then
+      W_CLASS[i]=REVIEW; W_REASON[i]="clean index, but ${W_UNTRACKED[i]} untracked file(s) would be lost"; W_EVID[i]=$ev; continue
+    fi
+    if [[ ${W_SENSITIVE[i]} -gt 0 ]]; then
+      W_CLASS[i]=REVIEW; W_REASON[i]="clean, but ${W_SENSITIVE[i]} ignored file(s) look sensitive and would be deleted with it: ${W_SENSITIVE_EXAMPLES[i]}"
+      W_EVID[i]=$ev; continue
+    fi
+    if [[ ${W_OTHER[i]} -gt 0 ]]; then
+      W_CLASS[i]=REVIEW; W_REASON[i]="clean, but ${W_OTHER[i]} ignored file(s)/dir(s) that are not recognised build output would be deleted with it: ${W_OTHER_EXAMPLES[i]}"
+      W_EVID[i]=$ev; continue
+    fi
+    local clean_desc="clean"
+    [[ ${W_IGNORED[i]} -gt 0 ]] && clean_desc="clean (${W_IGNORED[i]} ignored build-output/temp entr(y/ies) will be deleted with it)"
+
+    if [[ ${W_DETACHED[i]} -eq 1 || -z $b ]]; then
+      local holder2
+      if holder2=$(detached_head_holder "${W_HEAD[i]}"); then
+        W_CLASS[i]=SAFE; W_REASON[i]="$clean_desc; detached HEAD $(short_sha "${W_HEAD[i]}") is contained in $holder2"
+      elif is_ancestor "${W_HEAD[i]}" "$DEFAULT_REF_FULL"; then
+        W_CLASS[i]=REVIEW; W_REASON[i]="$clean_desc, and detached HEAD $(short_sha "${W_HEAD[i]}") is in $DEFAULT_REF as last fetched — re-run with --fetch to confirm"
+      else
+        W_CLASS[i]=REVIEW; W_REASON[i]="clean, but detached HEAD $(short_sha "${W_HEAD[i]}") is not in $DEFAULT_REF"
+      fi
+      W_EVID[i]=$ev; continue
+    fi
+
+    bi=$(branch_index_for "$b")
+    if [[ $bi -lt 0 ]]; then
+      W_CLASS[i]=UNKNOWN; W_REASON[i]="branch $b not found among local branches"; W_EVID[i]=$ev; continue
+    fi
+    case ${B_CLASS[bi]} in
+      PROTECTED) W_CLASS[i]=PROTECTED; W_REASON[i]="clean, but branch $b is protected (${B_REASON[bi]})" ;;
+      *)
+        case ${B_MCLASS[bi]} in
+          SAFE)     W_CLASS[i]=SAFE;     W_REASON[i]="$clean_desc; branch $b is ${B_MREASON[bi]}" ;;
+          SAFE_PR)  W_CLASS[i]=SAFE_PR;  W_REASON[i]="$clean_desc; branch $b: ${B_MREASON[bi]}" ;;
+          UNMERGED) W_CLASS[i]=UNMERGED; W_REASON[i]="clean, but branch $b has ${B_MREASON[bi]}" ;;
+          REVIEW)   W_CLASS[i]=REVIEW;   W_REASON[i]="clean, but branch $b: ${B_MREASON[bi]}" ;;
+          *)        W_CLASS[i]=UNKNOWN;  W_REASON[i]="clean, but branch $b could not be evaluated" ;;
+        esac ;;
+    esac
+    W_EVID[i]=$ev
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5: temp files, generated dirs, stashes
+# ---------------------------------------------------------------------------
+# Candidates come from `git ls-files --others`: only files git considers untracked in THIS
+# worktree. Tracked files never appear; nested repositories, submodules and linked worktrees
+# show up as opaque "dir/" entries and are never entered.
+analyze_temp_files() {
+  [[ $TEMP -eq 1 ]] || return 0
+  local rel rule cls note
+  while IFS= read -r -d '' rel; do
+    [[ -z $rel || $rel == */ ]] && continue
+    rule=$(temp_rule_for "${rel##*/}") || continue
+    [[ -f "$REPO_ROOT/$rel" && ! -L "$REPO_ROOT/$rel" ]] || continue
+    cls=SAFE; note=""
+    if looks_sensitive_temp "${rel##*/}"; then
+      cls=REVIEW; note="looks like a backup/swap copy of a sensitive file and may contain its secrets"
+    else
+      case $rule in
+        Vim*|temporary*)
+          if [[ -n $(find "$REPO_ROOT/$rel" -mmin -1440 2>/dev/null) ]]; then
+            cls=REVIEW; note="modified within the last 24h — may belong to an open editor session or running process"
+          fi ;;
+      esac
+    fi
+    T_PATH+=("$rel"); T_RULE+=("$rule"); T_CLASS+=("$cls"); T_NOTE+=("$note")
+  done < <(git ls-files --others -z --exclude='node_modules/' 2>/dev/null)
+  # Tracked files that merely look temporary are reported so the user knows they were seen.
+  while IFS= read -r -d '' rel; do
+    temp_rule_for "${rel##*/}" >/dev/null && T_TRACKED_SKIPPED+=("$rel")
+  done < <(git ls-files -z 2>/dev/null)
+}
+
+# Returns 0 and prints nothing when directory $1 (repo-relative) may be offered for deletion;
+# prints the blocking reason otherwise. Shared by the audit and the pre-delete revalidation.
+generated_dir_blocker() {
+  local rel=$1 d="$REPO_ROOT/$1"
+  [[ -d $d && ! -L $d ]] || { printf 'not a directory'; return 1; }
+  [[ -z $(find "$d" -name .git -print 2>/dev/null | head -n 1) ]] || { printf 'contains a nested repository'; return 1; }
+  git check-ignore -q -- "$rel" 2>/dev/null || { printf 'not ignored by git'; return 1; }
+  [[ -z $(git ls-files -z -- "$rel" 2>/dev/null | head -c 1) ]] || { printf 'contains tracked files'; return 1; }
+  return 0
+}
+
+evaluate_generated_dir() {
+  local rel=$1 why hit size
+  if ! why=$(generated_dir_blocker "$rel"); then G_SKIPPED+=("$rel ($why)"); return 0; fi
+  size=$(du -sh -- "$REPO_ROOT/$rel" 2>/dev/null | cut -f1)
+  G_PATH+=("$rel"); G_SIZE+=("$(trim "$size")")
+  hit=$(sensitive_files_under "$REPO_ROOT/$rel")
+  if [[ -n $hit ]]; then G_CLASS+=(REVIEW); G_NOTE+=("contains sensitive-looking file(s): $hit")
+  else G_CLASS+=(SAFE); G_NOTE+=(""); fi
+}
+
+# Generated directories are discovered through git: fully-untracked directories appear
+# collapsed ("node_modules/"); files inside partially-tracked directories appear
+# individually, and their generated ancestor is then checked for tracked content.
+analyze_generated() {
+  [[ $GENERATED -eq 1 ]] || return 0
+  local entry prefix i dup seen=()
+  while IFS= read -r -d '' entry; do
+    [[ -n $entry ]] || continue
+    if [[ $entry == */ ]]; then
+      prefix=${entry%/}
+      generated_dir_prefix "$entry" >/dev/null || continue
+      [[ $(generated_dir_prefix "$entry") == "$prefix" ]] || continue   # only when the dir itself is the generated one
+    else
+      prefix=$(generated_dir_prefix "$entry") || continue
+    fi
+    dup=0; for ((i = 0; i < ${#seen[@]}; i++)); do [[ ${seen[i]} == "$prefix" ]] && { dup=1; break; }; done
+    [[ $dup -eq 1 ]] && continue
+    seen+=("$prefix")
+    evaluate_generated_dir "$prefix"
+  done < <(git ls-files --others --directory -z 2>/dev/null)
+}
+
+analyze_stashes() {
+  local line
+  while IFS= read -r line; do
+    [[ -n $line ]] && S_LIST+=("$line")
+  done < <(git stash list --format='%gd%x1f%gs' 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# Phase 6: report
+# ---------------------------------------------------------------------------
+count_generated_safe() { local i n=0; for ((i = 0; i < ${#G_PATH[@]}; i++)); do [[ ${G_CLASS[i]} == SAFE ]] && n=$((n + 1)); done; printf '%s' "$n"; }
+
+count_class() { # $1 = B|W|T, rest = classes
+  local kind=$1; shift
+  local n=0 i c cls
+  case $kind in
+    B) for ((i = 0; i < ${#B_NAME[@]}; i++)); do c=${B_CLASS[i]}; for cls in "$@"; do [[ $c == "$cls" ]] && n=$((n + 1)); done; done ;;
+    W) for ((i = 0; i < ${#W_PATH[@]}; i++)); do c=${W_CLASS[i]}; for cls in "$@"; do [[ $c == "$cls" ]] && n=$((n + 1)); done; done ;;
+    T) for ((i = 0; i < ${#T_PATH[@]}; i++)); do c=${T_CLASS[i]}; for cls in "$@"; do [[ $c == "$cls" ]] && n=$((n + 1)); done; done ;;
+    R) for ((i = 0; i < ${#R_REF[@]}; i++)); do c=${R_CLASS[i]}; for cls in "$@"; do [[ $c == "$cls" ]] && n=$((n + 1)); done; done ;;
+  esac
+  printf '%s' "$n"
+}
+
+print_report() {
+  local mode="dry run"; [[ $APPLY -eq 1 ]] && mode="apply"
+  title "Git Cleanup  ($mode)"
+  kv "Repository" "$REPO_ROOT"
+  if [[ -n $CWD_TOPLEVEL && $CWD_TOPLEVEL != "$REPO_ROOT" ]]; then kv "Running from" "$CWD_TOPLEVEL (linked worktree)"; fi
+  kv "Current branch" "${CURRENT_BRANCH:-(detached HEAD)}"
+  kv "Default branch" "$DEFAULT_REF  ($DEFAULT_SOURCE)"
+  kv "Remote" "${REMOTE:-(none)}${REMOTE_URL:+  $REMOTE_URL}"
+  kv "Fetch" "$FETCH_STATUS"
+  kv "GitHub CLI" "$GH_STATUS"
+  kv "Protected" "${PROTECTED[*]}"
+
+  local i
+  title "Stale remote-tracking refs"
+  if [[ -z $REMOTE ]]; then
+    note "no remote"
+  elif [[ $FETCH -eq 0 ]]; then
+    note "not checked (pass --fetch to compare $REMOTE/* against the remote)"
+  elif [[ ${#R_REF[@]} -eq 0 ]]; then
+    ok "none — every $REMOTE/* ref still exists on the remote"
+  fi
+  for ((i = 0; i < ${#R_REF[@]}; i++)); do
+    print_item "${R_CLASS[i]}" "${R_REF[i]}" "${R_REASON[i]}" "points at ${R_SHA[i]}" "$(verdict_for "${R_CLASS[i]}" "git update-ref -d")"
+  done
+  title "Branches"
+  if [[ ${#B_NAME[@]} -eq 0 ]]; then note "no local branches"; fi
+  for ((i = 0; i < ${#B_NAME[@]}; i++)); do
+    local how="git branch -d"; [[ ${B_CLASS[i]} == SAFE_PR ]] && how="git branch -D, PR #${B_PRNUM[i]}"
+    print_item "${B_CLASS[i]}" "${B_NAME[i]}" "${B_REASON[i]}" "${B_EVID[i]}" "$(verdict_for "${B_CLASS[i]}" "$how")"
+  done
+
+  title "Worktrees"
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    local label=${W_PATH[i]}
+    [[ -n ${W_BRANCH[i]} ]] && label="$label  [${W_BRANCH[i]}]"
+    [[ ${W_DETACHED[i]} -eq 1 ]] && label="$label  [detached]"
+    print_item "${W_CLASS[i]}" "$label" "${W_REASON[i]}" "${W_EVID[i]}" "$(verdict_for "${W_CLASS[i]}" "git worktree remove")"
+  done
+
+  title "Temporary files"
+  if [[ $TEMP -eq 0 ]]; then
+    note "not scanned (pass --temp to look for .DS_Store, *.swp, *.swo, *~, *.tmp)"
+  elif [[ ${#T_PATH[@]} -eq 0 && ${#T_TRACKED_SKIPPED[@]} -eq 0 ]]; then
+    ok "none found"
+  else
+    for ((i = 0; i < ${#T_PATH[@]}; i++)); do
+      if [[ ${T_CLASS[i]} == SAFE ]]; then ok "${T_PATH[i]}"; else warn "${T_PATH[i]}"; fi
+      detail "rule: ${T_RULE[i]}; untracked and not ignored-sensitive"
+      [[ -n ${T_NOTE[i]} ]] && detail "${T_NOTE[i]} — keeping"
+    done
+    for ((i = 0; i < ${#T_TRACKED_SKIPPED[@]}; i++)); do
+      note "${T_TRACKED_SKIPPED[i]}"; detail "matches a temp pattern but is TRACKED by git — never touched"
+    done
+  fi
+
+  if [[ $GENERATED -eq 1 ]]; then
+    title "Generated directories (optional; per-item confirmation only)"
+    if [[ ${#G_PATH[@]} -eq 0 && ${#G_SKIPPED[@]} -eq 0 ]]; then ok "none found"; fi
+    for ((i = 0; i < ${#G_PATH[@]}; i++)); do
+      if [[ ${G_CLASS[i]} == SAFE ]]; then
+        warn "${G_PATH[i]}  (${G_SIZE[i]})"; detail "ignored by git, no tracked files inside; regenerable. Removed only with --apply and a per-item 'yes'."
+      else
+        warn "${G_PATH[i]}  (${G_SIZE[i]})"; detail "${G_NOTE[i]} — keeping"
+      fi
+    done
+    for ((i = 0; i < ${#G_SKIPPED[@]}; i++)); do
+      note "${G_SKIPPED[i]}"; detail "name looks generated but it is not safe to offer — never touched"
+    done
+  fi
+
+  title "Stashes"
+  if [[ ${#S_LIST[@]} -eq 0 ]]; then
+    ok "no stashes"
+  else
+    warn "${#S_LIST[@]} stash(es) exist — stashes are never removed by this tool"
+    local ref subj sbranch bi
+    for ((i = 0; i < ${#S_LIST[@]}; i++)); do
+      ref=${S_LIST[i]%%"$SEP"*}; subj=${S_LIST[i]#*"$SEP"}
+      detail "$ref: $subj"
+      sbranch=${subj#WIP on }; sbranch=${sbranch#On }; sbranch=${sbranch%%:*}
+      bi=$(branch_index_for "$sbranch")
+      if [[ $bi -ge 0 && ( ${B_CLASS[bi]} == SAFE || ${B_CLASS[bi]} == SAFE_PR ) ]]; then
+        detail "  ↳ was made on branch '$sbranch', which is a removal candidate — check it before cleaning up"
+      fi
+    done
+  fi
+
+  title "Summary"
+  kv "Safe branches:"    "$(count_class B SAFE)  (+ $(count_class B SAFE_PR) via merged PR, confirm each)"
+  kv "Safe worktrees:"   "$(count_class W SAFE)  (+ $(count_class W SAFE_PR) via merged PR, confirm each; $(count_class W STALE) stale entries)"
+  if [[ $FETCH -eq 1 && -n $REMOTE ]]; then kv "Stale remote refs:" "$(count_class R SAFE) safe  ($(count_class R REVIEW) need review)"; fi
+  if [[ $TEMP -eq 1 ]]; then kv "Temporary files:" "$(count_class T SAFE)  ($(count_class T REVIEW) held for review)"; fi
+  [[ $GENERATED -eq 1 ]] && kv "Generated dirs:" "${#G_PATH[@]}  (listed only; $(count_generated_safe) eligible for per-item confirmation)"
+  kv "Needs review:"     "$(( $(count_class B REVIEW) + $(count_class W REVIEW) + $(count_class R REVIEW) ))"
+  kv "Unmerged/dirty:"   "$(( $(count_class B UNMERGED UNKNOWN) + $(count_class W UNMERGED DIRTY UNKNOWN) ))"
+  kv "Protected/in use:" "$(( $(count_class B PROTECTED IN_USE) + $(count_class W PROTECTED IN_USE) ))"
+  kv "Stashes:"          "${#S_LIST[@]}  (never removed)"
+
+  if [[ $APPLY -eq 0 ]]; then
+    printf '\n%sNo changes have been made.%s\n' "$C_BOLD" "$C_RESET"
+    printf 'Run with --apply to review and perform cleanup'
+    [[ $FETCH -eq 0 && -n $REMOTE ]] && printf ' (add --fetch to refresh remote state first)'
+    printf '.\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Phase 7: cleanup plan + confirmation
+# ---------------------------------------------------------------------------
+add_plan() { P_KIND+=("$1"); P_IDX+=("$2"); P_LABEL+=("$3"); P_CONFIRM+=("$4"); }
+
+build_plan() {
+  local i
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ ${W_CLASS[i]} == SAFE ]] && add_plan worktree "$i" "Removing worktree ${W_PATH[i]}" 0
+  done
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ ${W_CLASS[i]} == SAFE_PR ]] && add_plan worktree "$i" "Removing worktree ${W_PATH[i]} (branch merged via PR)" 1
+  done
+  for ((i = 0; i < ${#W_PATH[@]}; i++)); do
+    [[ ${W_CLASS[i]} == STALE ]] && add_plan worktree "$i" "Removing stale worktree entry ${W_PATH[i]}" 0
+  done
+  for ((i = 0; i < ${#B_NAME[@]}; i++)); do
+    [[ ${B_CLASS[i]} == SAFE ]] && add_plan branch "$i" "Removing branch ${B_NAME[i]}" 0
+  done
+  for ((i = 0; i < ${#B_NAME[@]}; i++)); do
+    [[ ${B_CLASS[i]} == SAFE_PR ]] && add_plan branch "$i" "Force-removing branch ${B_NAME[i]} (PR #${B_PRNUM[i]})" 1
+  done
+  for ((i = 0; i < ${#R_REF[@]}; i++)); do
+    [[ ${R_CLASS[i]} == SAFE ]] && add_plan remoteref "$i" "Removing stale remote-tracking ref ${R_REF[i]}" 0
+  done
+  [[ $(count_class T SAFE) -gt 0 ]] && add_plan temp 0 "Removing $(count_class T SAFE) temporary file(s)" 0
+  for ((i = 0; i < ${#G_PATH[@]}; i++)); do
+    [[ ${G_CLASS[i]} == SAFE ]] && add_plan generated "$i" "Deleting generated directory ${G_PATH[i]} (${G_SIZE[i]})" 1
+  done
+}
+
+confirm_cleanup() {
+  build_plan
+  local total=${#P_KIND[@]} batch=0 per_item=0 i
+  for ((i = 0; i < total; i++)); do
+    if [[ ${P_CONFIRM[i]} -eq 1 ]]; then per_item=$((per_item + 1)); else batch=$((batch + 1)); fi
+  done
+
+  title "Cleanup plan"
+  if [[ $total -eq 0 ]]; then
+    ok "Nothing qualifies for cleanup. No changes made."
+    exit 0
+  fi
+  for ((i = 0; i < total; i++)); do
+    if [[ ${P_CONFIRM[i]} -eq 1 ]]; then
+      printf '  %2d. %s  %s[asks first]%s\n' "$((i + 1))" "${P_LABEL[i]}" "$C_YELLOW" "$C_RESET"
+    else
+      printf '  %2d. %s\n' "$((i + 1))" "${P_LABEL[i]}"
+    fi
+  done
+  printf '\n'
+  note "Every item is re-validated immediately before it is touched; anything that changed is skipped."
+  note "Recovery details (branch tips, worktree HEADs) are appended to $LOG_FILE"
+
+  if [[ $batch -gt 0 ]]; then
+    if [[ $YES -eq 1 ]]; then
+      note "--yes given: proceeding with the $batch item(s) that passed every SAFE check without prompting."
+    else
+      printf '\n'
+      ask "Proceed with the $batch SAFE item(s) above? [y/N] "
+      case $? in
+        0) ;;
+        2) die "no terminal available for confirmation. Re-run interactively, or use --apply --yes to proceed with SAFE items only (items marked [asks first] are skipped without a terminal)." ;;
+        *) printf '\nAborted. Nothing was changed.\n'; exit 0 ;;
+      esac
+    fi
+  elif [[ $per_item -gt 0 ]]; then
+    note "Only items requiring individual confirmation remain."
+  fi
+  printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 8: revalidation + execution
+# ---------------------------------------------------------------------------
+# Each revalidate_* prints a reason on stdout and returns 1 when the item must be skipped.
+
+revalidate_branch() {
+  local i=$1 name=${B_NAME[$1]} cur
+  cur=$(git rev-parse --verify --quiet "refs/heads/$name" 2>/dev/null) || { printf 'branch no longer exists'; return 1; }
+  [[ $cur == "${B_SHA[i]}" ]] || { printf 'tip changed since the audit (%s → %s)' "$(short_sha "${B_SHA[i]}")" "$(short_sha "$cur")"; return 1; }
+  if git worktree list --porcelain 2>/dev/null | grep -qxF -- "branch refs/heads/$name"; then
+    printf 'still checked out in a worktree'; return 1
+  fi
+  case ${B_CLASS[i]} in
+    SAFE)
+      is_ancestor "$cur" "$DEFAULT_REF_FULL" || { printf 'no longer an ancestor of %s' "$DEFAULT_REF"; return 1; } ;;
+    SAFE_PR)
+      [[ -n ${B_PRHEAD[i]} && -n ${B_PRMERGE[i]} ]] || { printf 'PR evidence missing'; return 1; }
+      remote_state_is_fresh || { printf 'remote state not fetched in this run'; return 1; }
+      is_ancestor "${B_PRMERGE[i]}" "$DEFAULT_REF_FULL" || { printf 'PR merge commit no longer in %s' "$DEFAULT_REF"; return 1; }
+      if [[ $cur != "${B_PRHEAD[i]}" ]]; then
+        if ! have_commit "${B_PRHEAD[i]}" || ! is_ancestor "$cur" "${B_PRHEAD[i]}"; then
+          printf 'tip no longer matches merged PR head'; return 1
+        fi
+      fi ;;
+    *) printf 'not a SAFE classification'; return 1 ;;
+  esac
+  return 0
+}
+
+revalidate_worktree() {
+  local i=$1 p=${W_PATH[$1]} cur bi
+  [[ -d $p ]] || { printf 'directory no longer exists'; return 1; }
+  worktree_registered "$p" || { printf 'no longer registered as a worktree'; return 1; }
+  cur=$(git -C "$p" rev-parse --verify --quiet HEAD 2>/dev/null) || { printf 'cannot read HEAD'; return 1; }
+  [[ $cur == "${W_HEAD[i]}" ]] || { printf 'HEAD changed since the audit'; return 1; }
+  local curbranch
+  curbranch=$(git -C "$p" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  [[ $curbranch == "${W_BRANCH[i]}" ]] || { printf 'checked-out branch changed since the audit'; return 1; }
+  local gp
+  gp=$(git -C "$p" rev-parse --path-format=absolute --git-path . 2>/dev/null); gp=${gp%/.}
+  if [[ -d $gp/rebase-merge || -d $gp/rebase-apply || -f $gp/MERGE_HEAD || -f $gp/CHERRY_PICK_HEAD || -f $gp/REVERT_HEAD || -f $gp/BISECT_LOG ]]; then
+    printf 'an operation is now in progress'; return 1
+  fi
+  [[ $p != "$CWD_TOPLEVEL" ]] || { printf 'this is the current worktree'; return 1; }
+  [[ -n $(git -C "$p" status --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null) ]] \
+    && { printf 'no longer clean'; return 1; }
+  if [[ -n ${W_BRANCH[i]} ]]; then
+    bi=$(branch_index_for "${W_BRANCH[i]}")
+    [[ $bi -ge 0 ]] || { printf 'branch vanished'; return 1; }
+    [[ $(git rev-parse --verify --quiet "refs/heads/${W_BRANCH[i]}" 2>/dev/null) == "${B_SHA[bi]}" ]] \
+      || { printf 'branch tip changed since the audit'; return 1; }
+    case ${W_CLASS[i]} in
+      SAFE)    is_ancestor "$cur" "$DEFAULT_REF_FULL" || { printf 'branch no longer merged'; return 1; } ;;
+      SAFE_PR) [[ -n ${B_PRHEAD[bi]} && -n ${B_PRMERGE[bi]} ]] || { printf 'PR evidence missing'; return 1; }
+               remote_state_is_fresh || { printf 'remote state not fetched in this run'; return 1; }
+               is_ancestor "${B_PRMERGE[bi]}" "$DEFAULT_REF_FULL" || { printf 'PR merge commit no longer in %s' "$DEFAULT_REF"; return 1; }
+               [[ $cur == "${B_PRHEAD[bi]}" ]] || is_ancestor "$cur" "${B_PRHEAD[bi]}" || { printf 'tip no longer matches merged PR head'; return 1; } ;;
+      *) printf 'not a SAFE classification'; return 1 ;;
+    esac
+  else
+    detached_head_holder "$cur" >/dev/null || { printf 'detached HEAD no longer held by a local branch or the fetched %s' "$DEFAULT_REF"; return 1; }
+  fi
+  return 0
+}
+
+# A stale entry: directory still missing, still registered, HEAD unchanged, commits still held.
+revalidate_stale_worktree() {
+  local i=$1 p=${W_PATH[$1]} line cur="" inblock=0
+  [[ ! -d $p ]] || { printf 'directory reappeared'; return 1; }
+  while IFS= read -r line; do
+    case $line in
+      "worktree "*) inblock=0; [[ $(physical_path "${line#worktree }") == "$p" ]] && inblock=1 ;;
+      "HEAD "*) [[ $inblock -eq 1 ]] && cur=${line#HEAD } ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  [[ -n $cur ]] || { printf 'no longer registered as a worktree'; return 1; }
+  [[ $cur == "${W_HEAD[i]}" ]] || { printf 'HEAD changed since the audit'; return 1; }
+  if [[ -n ${W_BRANCH[i]} ]]; then
+    ref_exists "refs/heads/${W_BRANCH[i]}" || { printf 'branch %s vanished' "${W_BRANCH[i]}"; return 1; }
+  else
+    detached_head_holder "$cur" >/dev/null || { printf 'detached HEAD no longer held by a local branch or the fetched %s' "$DEFAULT_REF"; return 1; }
+  fi
+  return 0
+}
+
+revalidate_remote_ref() {
+  local i=$1 cur
+  cur=$(git rev-parse --verify --quiet "refs/remotes/${R_REF[i]}" 2>/dev/null) || { printf 'ref no longer exists'; return 1; }
+  [[ $cur == "${R_SHA[i]}" ]] || { printf 'ref moved since the audit'; return 1; }
+  [[ ${R_CLASS[i]} == SAFE ]] || { printf 'not a SAFE classification'; return 1; }
+  is_ancestor "$cur" "$DEFAULT_REF_FULL" || containing_ref_for "$cur" >/dev/null || { printf 'commits no longer held elsewhere'; return 1; }
+  return 0
+}
+
+cleanup_remote_ref() {
+  local i=$1 err
+  # The old value is passed so git refuses if the ref changed underneath us.
+  if err=$(git update-ref -d "refs/remotes/${R_REF[i]}" "${R_SHA[i]}" 2>&1); then
+    log_action "remote-ref-removed ref=refs/remotes/${R_REF[i]} sha=${R_SHA[i]}  restore: git update-ref refs/remotes/${R_REF[i]} ${R_SHA[i]}"
+    return 0
+  fi
+  printf '%s' "$(trim "$err")"; return 1
+}
+
+cleanup_worktree() {
+  local i=$1 p=${W_PATH[$1]} err
+  if err=$(git worktree remove -- "$p" 2>&1); then
+    log_action "worktree-removed path=$p branch=${W_BRANCH[i]:-detached} head=${W_HEAD[i]}"
+    WORKTREES_REMOVED=$((WORKTREES_REMOVED + 1)); return 0
+  fi
+  printf '%s' "$(trim "$err")"; return 1
+}
+
+cleanup_branch() {
+  local i=$1 name=${B_NAME[$1]} err
+  case ${B_CLASS[i]} in
+    SAFE)
+      # -d lets git run its own merged check. If it refuses, we stop — never fall back to -D.
+      if err=$(git branch -d -- "$name" 2>&1); then
+        log_action "branch-deleted name=$name tip=${B_SHA[i]}  restore: git branch $name ${B_SHA[i]}"; return 0
+      fi
+      printf 'git refused: %s (git -d checks against HEAD/upstream; update your local %s and retry, or delete manually)' "$(trim "$err")" "$DEFAULT_BRANCH"; return 1 ;;
+    SAFE_PR)
+      if err=$(git branch -D -- "$name" 2>&1); then
+        log_action "branch-force-deleted name=$name tip=${B_SHA[i]} pr=#${B_PRNUM[i]}  restore: git branch $name ${B_SHA[i]}"; return 0
+      fi
+      printf 'git refused: %s' "$(trim "$err")"; return 1 ;;
+  esac
+  printf 'refusing: class %s' "${B_CLASS[i]}"; return 1
+}
+
+cleanup_temp_files() {
+  local i f removed=0 skipped=0
+  for ((i = 0; i < ${#T_PATH[@]}; i++)); do
+    [[ ${T_CLASS[i]} == SAFE ]] || continue
+    f="$REPO_ROOT/${T_PATH[i]}"
+    # Revalidate: still a regular file, still untracked, still matches its rule.
+    if [[ ! -f $f || -L $f ]] || git ls-files --error-unmatch -- "${T_PATH[i]}" >/dev/null 2>&1 \
+       || ! temp_rule_for "${f##*/}" >/dev/null || looks_sensitive_temp "${f##*/}"; then
+      skipped=$((skipped + 1)); continue
+    fi
+    case ${T_RULE[i]} in
+      Vim*|temporary*) [[ -n $(find "$f" -mmin -1440 2>/dev/null) ]] && { skipped=$((skipped + 1)); continue; } ;;
+    esac
+    if rm -f -- "$f" 2>/dev/null; then
+      removed=$((removed + 1)); log_action "temp-file-removed path=${T_PATH[i]}"
+    else
+      skipped=$((skipped + 1))
+    fi
+  done
+  printf '%d removed' "$removed"; [[ $skipped -gt 0 ]] && printf ', %d skipped' "$skipped"
+  return 0
+}
+
+cleanup_generated() {
+  local i=$1 rel=${G_PATH[$1]} d="$REPO_ROOT/${G_PATH[$1]}" why
+  [[ ${G_CLASS[i]} == SAFE ]] || { printf 'not eligible'; return 1; }
+  case $rel in ""|.|..|/*|*/../*|../*|*/..) printf 'refusing suspicious path'; return 1 ;; esac
+  if ! why=$(generated_dir_blocker "$rel"); then printf '%s' "$why"; return 1; fi
+  if [[ -n $(sensitive_files_under "$d") ]]; then
+    printf 'now contains sensitive-looking files'; return 1
+  fi
+  if rm -rf -- "$d" 2>/dev/null; then log_action "generated-dir-removed path=$rel"; return 0; fi
+  printf 'rm failed'; return 1
+}
+
+progress_label() { # "[i/N] label ....... "
+  local label="[$1/$2] $3" pad
+  pad=$((56 - ${#label})); [[ $pad -lt 3 ]] && pad=3
+  printf '%s %s ' "$label" "$(printf '%*s' "$pad" '' | tr ' ' '.')"
+}
+
+run_cleanup() {
+  local total=${#P_KIND[@]} i kind idx msg rc
+  for ((i = 0; i < total; i++)); do
+    kind=${P_KIND[i]}; idx=${P_IDX[i]}
+    if [[ ${P_CONFIRM[i]} -eq 1 ]]; then
+      printf '\n'
+      case $kind in
+        branch)    warn "${P_LABEL[i]} uses git branch -D. Evidence: ${B_REASON[idx]}"
+                   detail "Recover later with: git branch ${B_NAME[idx]} ${B_SHA[idx]}" ;;
+        worktree)  warn "${P_LABEL[i]}. Evidence: ${W_REASON[idx]}" ;;
+        generated) warn "${P_LABEL[i]} — regenerable build output, but deletion is permanent." ;;
+      esac
+      ask "    Proceed with this item? [y/N] "
+      case $? in
+        0) ;;
+        2) progress_label "$((i + 1))" "$total" "${P_LABEL[i]}"; printf '%sskipped%s (no terminal for confirmation)\n' "$C_YELLOW" "$C_RESET"; continue ;;
+        *) progress_label "$((i + 1))" "$total" "${P_LABEL[i]}"; printf '%sskipped%s (declined)\n' "$C_YELLOW" "$C_RESET"; continue ;;
+      esac
+    fi
+
+    progress_label "$((i + 1))" "$total" "${P_LABEL[i]}"
+    case $kind in
+      worktree)
+        if [[ ${W_CLASS[idx]} == STALE ]]; then msg=$(revalidate_stale_worktree "$idx"); rc=$?
+        else msg=$(revalidate_worktree "$idx"); rc=$?; fi
+        if [[ $rc -eq 0 ]]; then
+          if msg=$(cleanup_worktree "$idx"); then rc=0; else rc=1; fi
+        else rc=2; fi ;;
+      remoteref)
+        if msg=$(revalidate_remote_ref "$idx"); then
+          if msg=$(cleanup_remote_ref "$idx"); then rc=0; else rc=1; fi
+        else rc=2; fi ;;
+      branch)
+        if msg=$(revalidate_branch "$idx"); then
+          if msg=$(cleanup_branch "$idx"); then rc=0; else rc=1; fi
+        else rc=2; fi ;;
+      temp)
+        msg=$(cleanup_temp_files); rc=0 ;;
+      generated)
+        if msg=$(cleanup_generated "$idx"); then rc=0; else rc=1; fi ;;
+      *) msg="unknown plan item"; rc=1 ;;
+    esac
+    case $rc in
+      0) ACTIONS_DONE=$((ACTIONS_DONE + 1)); printf '%s✓%s%s\n' "$C_GREEN" "$C_RESET" "${msg:+ $msg}" ;;
+      2) printf '%sskipped%s (%s)\n' "$C_YELLOW" "$C_RESET" "$msg" ;;
+      *) printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$msg" ;;
+    esac
+  done
+
+  printf '\n%sCleanup complete.%s %d action(s) performed.\n' "$C_BOLD" "$C_RESET" "$ACTIONS_DONE"
+  if [[ $ACTIONS_DONE -gt 0 ]]; then
+    note "Deleted branch tips stay in the object database until git gc expires them (default ~2 weeks)."
+    note "Recovery details: $LOG_FILE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+need_arg() { [[ $# -ge 2 && -n $2 ]] || die "$1 requires a value"; }
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --apply)        APPLY=1 ;;
+      --yes|-y)       YES=1 ;;
+      --fetch)        FETCH=1 ;;
+      --no-fetch)     FETCH=0 ;;
+      --verbose|-v)   VERBOSE=1 ;;
+      --temp)         TEMP=1 ;;
+      --generated)    GENERATED=1 ;;
+      --no-gh)        USE_GH=0 ;;
+      --no-color)     COLOR_MODE=never ;;
+      --protected)    need_arg "$@"; add_protected "$2"; shift ;;
+      --protected=*)  add_protected "${1#*=}" ;;
+      --remote)       need_arg "$@"; REMOTE_OPT=$2; shift ;;
+      --remote=*)     REMOTE_OPT=${1#*=} ;;
+      --default)      need_arg "$@"; DEFAULT_OPT=$2; shift ;;
+      --default=*)    DEFAULT_OPT=${1#*=} ;;
+      --gh-repo)      need_arg "$@"; GH_REPO_OPT=$2; shift ;;
+      --gh-repo=*)    GH_REPO_OPT=${1#*=} ;;
+      --version)      printf 'git-cleanup %s\n' "$VERSION"; exit 0 ;;
+      -h|--help)      usage; exit 0 ;;
+      *)              die "unknown option: $1 (see --help)" ;;
+    esac
+    shift
+  done
+  setup_colors
+  trap on_interrupt INT TERM
+  [[ $YES -eq 1 && $APPLY -eq 0 ]] && printf 'git-cleanup: note: --yes has no effect without --apply\n' >&2
+
+  detect_repo
+  detect_remote
+  refresh_remotes
+  detect_default_branch
+  detect_gh
+  collect_worktrees
+  collect_branches
+  analyze_stale_remote_refs
+  analyze_branches
+  analyze_worktrees
+  analyze_temp_files
+  analyze_generated
+  analyze_stashes
+  print_report
+
+  [[ $APPLY -eq 1 ]] || exit 0
+  confirm_cleanup
+  run_cleanup
+}
+
+main "$@"

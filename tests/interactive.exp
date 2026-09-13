@@ -1,0 +1,27 @@
+# Drives a fully interactive `--apply`:
+#   * while the batch prompt is open, adds a commit to fix/merged-ff (a SAFE candidate) so
+#     the pre-delete revalidation must skip it;
+#   * declines the force delete of feature/pr-behind, accepts feature/squashed;
+#   * declines deleting .cache, accepts node_modules.
+# Env: GC (script path), BASH_BIN, WORK_REPO (fixture work dir). Run from WORK_REPO.
+set timeout 180
+set work $env(WORK_REPO)
+spawn $env(BASH_BIN) $env(GC) --fetch --gh-repo acme/fixture --apply --temp --generated --no-color
+expect {
+  -re {Proceed with the \d+ SAFE item\(s\) above\? \[y/N\] } {}
+  timeout { puts "TIMEOUT waiting for batch prompt"; exit 1 }
+}
+set tree [exec git -C $work rev-parse "fix/merged-ff^{tree}"]
+set new [exec git -C $work -c user.name=t -c user.email=t@example.com commit-tree -p fix/merged-ff -m "late commit" $tree]
+exec git -C $work update-ref refs/heads/fix/merged-ff $new
+send "y\r"
+expect {
+  -re {Force-removing branch feature/pr-behind[^\n]*\n[^\n]*\n[^\n]*Proceed with this item\? \[y/N\] } { send "n\r"; exp_continue }
+  -re {Force-removing branch feature/squashed[^\n]*\n[^\n]*\n[^\n]*Proceed with this item\? \[y/N\] } { send "y\r"; exp_continue }
+  -re {Deleting generated directory \.cache[^\n]*\n[^\n]*Proceed with this item\? \[y/N\] } { send "n\r"; exp_continue }
+  -re {Deleting generated directory node_modules[^\n]*\n[^\n]*Proceed with this item\? \[y/N\] } { send "y\r"; exp_continue }
+  -re {Cleanup complete} {}
+  timeout { puts "TIMEOUT"; exit 1 }
+  eof { puts "EOF before completion"; exit 1 }
+}
+expect eof

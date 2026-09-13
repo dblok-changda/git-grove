@@ -1,0 +1,12 @@
+# Drives `--apply --yes` and declines every per-item prompt (force deletes, generated
+# directories), so only items that passed every SAFE check are removed.
+# Env: GC (script path), BASH_BIN. Run from the fixture's work directory.
+set timeout 180
+spawn $env(BASH_BIN) $env(GC) --fetch --gh-repo acme/fixture --apply --yes --temp --generated --no-color
+expect {
+  -re {Proceed with this item\? \[y/N\] } { send "n\r"; exp_continue }
+  -re {Cleanup complete} {}
+  timeout { puts "TIMEOUT"; exit 1 }
+  eof { puts "EOF before completion"; exit 1 }
+}
+expect eof

@@ -5,7 +5,7 @@ class GitCleanup < Formula
   desc "Audit and safely remove merged Git branches, obsolete worktrees, and stale refs"
   homepage "https://github.com/dblok-changda/git-cleanup"
   url "https://github.com/dblok-changda/git-cleanup/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "6e2ce09faae5ec17e6aea27a8638b0a10dc9994533434df02dc7efa7a6544175"
+  sha256 "680d5cfb8403566046c6cd0a93082b76d227518b0681c0347876551d1cf6d4e5"
   head "https://github.com/dblok-changda/git-cleanup.git", branch: "main"
 
   depends_on "git"

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly VERSION="1.0.0"
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <repo-url> [target-directory]
@@ -10,11 +12,21 @@ Initializes a bare Git repository configured for worktree workflows.
 Arguments:
   <repo-url>          Git remote URL (SSH or HTTPS)
   [target-directory]  Optional folder name (defaults to repository name)
+
+Options:
+  -h, --help          Show this help
+  --version           Show version
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
-if [[ $# -lt 1 ]]; then
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+  --version) echo "git-worktree-init $VERSION"; exit 0 ;;
+  -*)        echo "Error: unknown option: $1" >&2; usage ;;
+esac
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
 fi
 
@@ -48,6 +60,14 @@ git --git-dir=.git fetch origin
 # Detect default branch from remote HEAD
 DEFAULT_BRANCH=$(git --git-dir=.git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)
 
+# Git before 2.48 doesn't create origin/HEAD on fetch; the bare clone's HEAD names the remote default
+if [[ -z "$DEFAULT_BRANCH" ]]; then
+  BARE_HEAD=$(git --git-dir=.git symbolic-ref --short HEAD 2>/dev/null || true)
+  if [[ -n "$BARE_HEAD" ]] && git --git-dir=.git show-ref --verify --quiet "refs/heads/$BARE_HEAD"; then
+    DEFAULT_BRANCH="$BARE_HEAD"
+  fi
+fi
+
 if [[ -z "$DEFAULT_BRANCH" ]]; then
   if git --git-dir=.git show-ref --verify --quiet refs/heads/main || git --git-dir=.git show-ref --verify --quiet refs/remotes/origin/main; then
     DEFAULT_BRANCH="main"
@@ -60,6 +80,12 @@ fi
 
 echo "==> Checking out default worktree: '$DEFAULT_BRANCH'..."
 git --git-dir=.git worktree add "$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
+
+# Bare clones create local branches without upstreams; track origin so pull/push/status work
+if git --git-dir=.git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+  echo "==> Tracking origin/$DEFAULT_BRANCH..."
+  git --git-dir=.git branch --set-upstream-to="origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
+fi
 
 cat <<EOF
 

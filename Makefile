@@ -9,7 +9,7 @@ TESTS = tests/test-grove.sh tests/test-init.sh tests/test-cleanup.sh
 install:
 	install -d "$(BINDIR)"
 	for s in $(SCRIPTS); do install -m 0755 "$$s" "$(BINDIR)/$$s" || exit 1; done
-	@echo "Installed $(SCRIPTS) to $(BINDIR)"
+	@echo "Installed $(SCRIPTS) to $(BINDIR)  (run: git grove help)"
 
 uninstall:
 	for s in $(SCRIPTS); do rm -f "$(BINDIR)/$$s"; done

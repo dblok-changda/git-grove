@@ -116,5 +116,69 @@ for t in git-cleanup git-worktree-init; do
   check_eq "${tv##* }" "$V" "$t version matches git-grove ($V)"
 done
 
+# ---------------------------------------------------------------------------
+TOOLS="git-grove git-cleanup git-worktree-init"
+
+section "T5  installer from a clone"
+BIN=$WORK/bin
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" >"$WORK/t5.txt" 2>&1
+check_exit $? 0 "install.sh exits 0"
+for t in $TOOLS; do
+  if [[ -x $BIN/$t ]]; then ok "installed $t"; else bad "$t not installed or not executable"; fi
+done
+check_grep "$WORK/t5.txt" "^Installed git-grove $V " "reports the installed version"
+for c in "grove --version" "cleanup --version" "worktree-init --version" "grove init --version" "grove cleanup --version"; do
+  # shellcheck disable=SC2086  # $c is split into a git subcommand and its arguments on purpose
+  out=$(PATH="$BIN:$PATH" git $c </dev/null 2>&1); rc=$?
+  check_exit $rc 0 "git $c runs from PATH"
+  check_eq "${out##* }" "$V" "git $c reports $V"
+done
+
+# ---------------------------------------------------------------------------
+section "T6  installing over an older git-cleanup"
+BIN2=$WORK/bin2
+mkdir -p "$BIN2"
+printf '#!/usr/bin/env bash\necho "git-cleanup 1.0.0"\n' >"$BIN2/git-cleanup"
+chmod 0755 "$BIN2/git-cleanup"
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN2" >/dev/null 2>&1
+check_exit $? 0 "install over an existing git-cleanup exits 0"
+check_eq "$("$BIN2/git-cleanup" --version)" "git-cleanup $V" "old git-cleanup replaced"
+
+# ---------------------------------------------------------------------------
+section "T7  piped installer downloads all three, or installs nothing"
+mkdir -p "$WORK/raw/main"
+for t in $TOOLS; do cp "$ROOT/$t" "$WORK/raw/main/"; done
+BIN3=$WORK/bin3
+GIT_GROVE_RAW_URL="file://$WORK/raw" "$BASH_BIN" -s -- --bindir "$BIN3" <"$ROOT/install.sh" >"$WORK/t7.txt" 2>&1
+check_exit $? 0 "piped install exits 0"
+for t in $TOOLS; do
+  if cmp -s "$BIN3/$t" "$ROOT/$t"; then ok "downloaded $t"; else bad "$t missing or differs from the published script"; fi
+done
+rm "$WORK/raw/main/git-worktree-init"
+BIN4=$WORK/bin4
+GIT_GROVE_RAW_URL="file://$WORK/raw" "$BASH_BIN" -s -- --bindir "$BIN4" <"$ROOT/install.sh" >"$WORK/t7b.txt" 2>&1
+check_exit $? 1 "piped install exits 1 when a download fails"
+check_grep "$WORK/t7b.txt" 'download failed: .*/git-worktree-init' "names the failed download"
+for t in $TOOLS; do check_absent "$BIN4/$t"; done
+
+# ---------------------------------------------------------------------------
+section "T8  uninstall"
+rm "$BIN3/git-grove" "$BIN3/git-worktree-init"   # like a pre-grove, git-cleanup-only install
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN3" --uninstall >/dev/null 2>&1
+check_exit $? 0 "uninstall with only git-cleanup present exits 0"
+check_absent "$BIN3/git-cleanup"
+chmod 0555 "$BIN"
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" --uninstall >"$WORK/t8.txt" 2>&1
+check_exit $? 1 "--uninstall exits 1 when files cannot be removed"
+check_grep "$WORK/t8.txt" "cannot remove" "explains why"
+check_present "$BIN/git-grove"
+chmod 0755 "$BIN"
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" --uninstall >/dev/null 2>&1
+check_exit $? 0 "--uninstall exits 0"
+for t in $TOOLS; do check_absent "$BIN/$t"; done
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" --uninstall >"$WORK/t8b.txt" 2>&1
+check_exit $? 0 "uninstall with nothing installed exits 0"
+check_grep "$WORK/t8b.txt" "Nothing installed" "says nothing was installed"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

@@ -1,5 +1,7 @@
 # git-cleanup reference
 
+Part of [git-grove](../README.md). `git grove cleanup` and `git cleanup` run this command.
+
 This document describes exactly what `git-cleanup` inspects, how it classifies each
 item, what `--apply` does, and how to recover. For installation and a quick start see
 the [README](../README.md).

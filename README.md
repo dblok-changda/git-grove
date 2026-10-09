@@ -1,4 +1,109 @@
-# git-cleanup
+# git-grove
+
+Work on every branch at once. git-grove sets a repository up as a bare clone with one
+folder per branch (`git grove init`), and tidies away the branches and worktrees you have
+finished with (`git grove cleanup`).
+
+```text
+my-project/
+├── .git/            bare repository
+├── main/            worktree for main
+├── feat-login/      worktree for feat-login
+└── fix-123/         worktree for fix-123
+```
+
+## Commands
+
+| Command | Same as | What it does |
+|---|---|---|
+| `git grove init <repo-url> [dir]` | `git worktree-init` | Clone into the bare repo + worktree layout |
+| `git grove cleanup [options]` | `git cleanup` | Audit, and on request remove, finished branches, worktrees, stale refs and temp files |
+| `git grove help` | | List commands |
+| `git grove --version` | | Show the version |
+
+Each command is also installed on its own, so `git cleanup` and `git worktree-init` work
+exactly as before. For a command's options use `-h` (`git grove init -h`, `git cleanup -h`).
+`git <command> --help` does not work, because Git intercepts it and looks for a man page.
+
+## Install
+
+Requirements: Git 2.31 or newer, Bash 3.2 or newer (the macOS system Bash is fine), macOS
+or Linux. Optional: the GitHub CLI (`gh`), logged in, lets cleanup recognise squash- and
+rebase-merged pull requests.
+
+Each method below installs three files on your PATH: `git-grove`, `git-cleanup`,
+`git-worktree-init`.
+
+**Homebrew**
+
+```bash
+brew tap dblok-changda/git-grove https://github.com/dblok-changda/git-grove
+brew install dblok-changda/git-grove/git-grove
+```
+
+**One-line installer** (installs to `/usr/local/bin` if writable, otherwise `~/.local/bin`)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dblok-changda/git-grove/main/install.sh | bash
+```
+
+**From a clone**
+
+```bash
+git clone https://github.com/dblok-changda/git-grove.git
+cd git-grove
+make install                 # or: make install PREFIX="$HOME/.local"
+```
+
+**Manually**: copy the three scripts anywhere on your PATH and make them executable.
+
+Uninstall with `make uninstall`, `./install.sh --uninstall`, or `brew uninstall git-grove`.
+
+### Coming from git-cleanup?
+
+This repository used to be `dblok-changda/git-cleanup`, and `git cleanup` works as before.
+
+- Installed with curl, make, or by hand: nothing breaks. Run the installer above again to
+  add `git grove` and `git worktree-init`.
+- Installed with Homebrew: run `brew update`. The `git-cleanup` formula is renamed to
+  `git-grove` and installs all three commands.
+
+## git grove init
+
+```text
+$ git grove init git@github.com:me/my-project.git
+==> Creating project directory: my-project
+==> Cloning bare repository into .git...
+==> Configuring remote fetch refspec...
+==> Fetching all remote branches...
+==> Checking out default worktree: 'main'...
+==> Tracking origin/main...
+
+✓ Setup complete!
+```
+
+A plain `git clone --bare` has no `remote.origin.fetch` refspec, so `git fetch` never
+creates `origin/*` branches and new remote branches stay invisible. `git grove init`
+configures the refspec, fetches everything, finds the remote's default branch (`main`,
+`master`, `develop`, or anything else), checks it out as the first worktree, and sets it
+to track `origin`.
+
+| Argument | Meaning |
+|---|---|
+| `<repo-url>` | Any URL `git clone` accepts (SSH, HTTPS, `file://`) |
+| `[target-directory]` | Folder to create. Defaults to the repository name without `.git`. Must not exist yet. |
+
+Working in the layout, from the project folder or any worktree:
+
+```bash
+cd my-project
+git worktree add feat-login -b feat-login main   # new branch from main
+git worktree add fix-123 fix-123                 # existing branch
+git worktree list
+git worktree remove feat-login                   # or let git grove cleanup find it
+```
+
+## git grove cleanup
 
 Audit, and only when you say so remove, the local Git leftovers that pile up after
 feature branches and pull requests are finished: merged local branches, obsolete
@@ -56,7 +161,7 @@ No changes have been made.
 Run with --apply to review and perform cleanup.
 ```
 
-## Why not `git branch --merged | xargs git branch -d`?
+### Why not `git branch --merged | xargs git branch -d`?
 
 That one-liner misses every squash-merged or rebase-merged branch, and the popular
 alternative of deleting any branch without a same-named remote destroys unpushed work.
@@ -65,47 +170,7 @@ confirms squash and rebase merges through the GitHub CLI, never trusts a branch 
 its age, re-validates every item immediately before touching it, and writes a recovery
 log for everything it removes.
 
-## Install
-
-Requirements: Git 2.31 or newer, Bash 3.2 or newer (the macOS system Bash is fine),
-macOS or Linux. Optional: the GitHub CLI (`gh`), logged in, to recognise squash and
-rebase-merged pull requests.
-
-Pick one method. Each puts a single file, `git-cleanup`, on your PATH.
-
-**Homebrew**
-
-```bash
-brew tap dblok-changda/git-cleanup https://github.com/dblok-changda/git-cleanup
-brew install dblok-changda/git-cleanup/git-cleanup
-```
-
-**One-line installer** (installs to `/usr/local/bin` if writable, otherwise `~/.local/bin`)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dblok-changda/git-cleanup/main/install.sh | bash
-```
-
-**From a clone**
-
-```bash
-git clone https://github.com/dblok-changda/git-cleanup.git
-cd git-cleanup
-make install                 # or: make install PREFIX=~/.local
-```
-
-**Manually**: copy `git-cleanup` anywhere on your PATH and make it executable.
-
-Afterwards both of these work, because Git runs any `git-<name>` found on PATH:
-
-```bash
-git-cleanup --help
-git cleanup --help
-```
-
-Uninstall with `make uninstall`, `./install.sh --uninstall`, or `brew uninstall git-cleanup`.
-
-## Getting started
+### Getting started
 
 From inside any repository:
 
@@ -125,7 +190,7 @@ You get a numbered plan, one `y/N` prompt for everything that passed every SAFE 
 and a separate prompt, with evidence and a recovery command, for each item that needs a
 force delete. Anything that changed since the audit is skipped automatically.
 
-## Cheatsheet
+### Cheatsheet
 
 ```bash
 git cleanup                       # audit only, no fetch, changes nothing
@@ -150,7 +215,7 @@ git cleanup --fetch --apply --yes # skip the one batch prompt for SAFE items onl
 | `--remote NAME`, `--default BRANCH` | Override remote or default-branch detection. |
 | `-v`, `--no-color`, `--version`, `-h` | Output control and help. |
 
-## How decisions are made
+### How decisions are made
 
 | Class | Meaning | Action under `--apply` |
 |---|---|---|
@@ -170,7 +235,7 @@ in the default branch or another ref, and REVIEW otherwise.
 Default protected patterns: `main master develop development staging production trunk
 release/* hotfix/*`.
 
-## What is never deleted
+### What is never deleted
 
 Stashes. `.env` and `.env.*`, credentials, keys, certificates, Terraform state,
 databases, and backup or swap copies of any of those. Untracked files and ignored files
@@ -178,7 +243,7 @@ that are not recognised build output. Anything in a nested repository or submodu
 Generated directories containing tracked files or secrets. Branches or worktrees with an
 operation in progress. `git clean` is never run, and `-d` never silently becomes `-D`.
 
-## Recovery
+### Recovery
 
 Every removal is appended to `.git/git-cleanup.log` with a restore command, for
 example:
@@ -190,7 +255,7 @@ example:
 Deleted branch tips stay in the object store until `git gc` expires them, about two
 weeks by default.
 
-## Typical workflow
+### Typical workflow
 
 1. After a batch of PRs lands, run `git cleanup --fetch --temp` in the repo.
 2. Resolve `REVIEW` items by hand: move an `.env` out of a worktree, create a
@@ -198,7 +263,7 @@ weeks by default.
 3. Run `git cleanup --fetch --apply --temp`, answer the prompts.
 4. If something was removed by mistake, use the restore line from the log.
 
-## Limitations
+### Limitations
 
 Squash and rebase merge detection works only through GitHub via `gh` (GitHub
 Enterprise included when `gh` is logged in to that host). GitLab and Bitbucket users
@@ -209,11 +274,11 @@ two. Windows is supported only through WSL.
 ## Testing
 
 ```bash
-make test          # builds disposable fixtures under $TMPDIR and checks about 130 assertions
+make test          # all three suites, with disposable repositories under $TMPDIR
 make test-bash3    # same, under the macOS system bash 3.2
 make lint          # shellcheck
 ```
 
-The tests never touch a real repository. See [docs/reference.md](docs/reference.md)
-for the full option reference, the exact rules behind each classification, the apply
-and revalidation flow, and the log format.
+The tests never touch the network or a real repository. See
+[docs/reference.md](docs/reference.md) for cleanup's full option reference, the exact rules
+behind each classification, the apply and revalidation flow, and the log format.

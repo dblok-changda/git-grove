@@ -57,12 +57,13 @@ git --git-dir=.git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin
 echo "==> Fetching all remote branches..."
 git --git-dir=.git fetch origin
 
-# Detect default branch from remote HEAD
-DEFAULT_BRANCH=$(git --git-dir=.git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)
+# Detect default branch from remote HEAD. Full ref names, not --short: --short turns
+# origin/main into remotes/origin/main when a branch or tag is also named origin/main.
+DEFAULT_BRANCH=$(git --git-dir=.git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed -n 's@^refs/remotes/origin/@@p' || true)
 
 # Git before 2.48 doesn't create origin/HEAD on fetch; the bare clone's HEAD names the remote default
 if [[ -z "$DEFAULT_BRANCH" ]]; then
-  BARE_HEAD=$(git --git-dir=.git symbolic-ref --short HEAD 2>/dev/null || true)
+  BARE_HEAD=$(git --git-dir=.git symbolic-ref HEAD 2>/dev/null | sed -n 's@^refs/heads/@@p' || true)
   if [[ -n "$BARE_HEAD" ]] && git --git-dir=.git show-ref --verify --quiet "refs/heads/$BARE_HEAD"; then
     DEFAULT_BRANCH="$BARE_HEAD"
   fi
@@ -84,7 +85,7 @@ git --git-dir=.git worktree add "$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
 # Bare clones create local branches without upstreams; track origin so pull/push/status work
 if git --git-dir=.git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
   echo "==> Tracking origin/$DEFAULT_BRANCH..."
-  git --git-dir=.git branch --set-upstream-to="origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
+  git --git-dir=.git branch --set-upstream-to="refs/remotes/origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
 fi
 
 cat <<EOF

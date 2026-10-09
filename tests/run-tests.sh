@@ -46,6 +46,8 @@ printf 'git-worktree-init self-test\n  script: %s\n  bash:   %s (%s)\n  git:    
 mkdir -p "$WORK/remotes" "$WORK/out"
 make_remote fixture main
 make_remote devrepo develop main
+make_remote ambiguous main origin/main
+git --git-dir="$WORK/remotes/ambiguous.git" tag main
 
 # ---------------------------------------------------------------------------
 section "T1  default branch main, directory inferred from URL"
@@ -82,6 +84,20 @@ if git --git-dir="$P/.git" rev-parse -q --verify refs/remotes/origin/HEAD >/dev/
 check_present "$P/develop/.git"
 check_absent "$P/main"
 check_eq "$(git -C "$P/develop" rev-parse --abbrev-ref '@{upstream}' 2>&1)" origin/develop "develop tracks origin/develop"
+
+# ---------------------------------------------------------------------------
+section "T2c branch named origin/main and tag named main (ambiguous short names)"
+for v in always never; do
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.followRemoteHEAD GIT_CONFIG_VALUE_0=$v \
+    run_gwi "file://$WORK/remotes/ambiguous.git" "ambiguous-$v" >"$WORK/t2c-$v.txt" 2>&1
+  check_exit $? 0 "exits 0 (followRemoteHEAD=$v)"
+  P=$WORK/out/ambiguous-$v
+  check_present "$P/main/.git"
+  check_absent "$P/remotes"
+  check_absent "$P/heads"
+  check_eq "$(git -C "$P/main" symbolic-ref HEAD 2>&1)" refs/heads/main "worktree is on refs/heads/main"
+  check_eq "$(git -C "$P/main" rev-parse --symbolic-full-name '@{upstream}' 2>&1)" refs/remotes/origin/main "main tracks refs/remotes/origin/main"
+done
 
 # ---------------------------------------------------------------------------
 section "T3  target directory already exists"

@@ -24,6 +24,9 @@ REF="main"; BINDIR=""; UNINSTALL=0
 
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
+# A symlink into a Homebrew Cellar belongs to Homebrew; replacing or removing it breaks brew.
+brew_owned() { case $(readlink "$1" 2>/dev/null) in */Cellar/*) return 0 ;; esac; return 1; }
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --bindir)    [[ $# -ge 2 ]] || die "--bindir needs a value"; BINDIR=$2; shift ;;
@@ -42,7 +45,6 @@ done
 # Pick a destination: a system dir we can write to, otherwise a per-user one.
 if [[ -z $BINDIR ]]; then
   if [[ -d /usr/local/bin && -w /usr/local/bin ]]; then BINDIR=/usr/local/bin
-  elif [[ -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then BINDIR=/opt/homebrew/bin
   else BINDIR=$HOME/.local/bin; fi
 fi
 
@@ -51,11 +53,14 @@ if [[ $UNINSTALL -eq 1 ]]; then
   for t in "${TOOLS[@]}"; do
     [[ -e $BINDIR/$t ]] || continue
     found=1
+    if brew_owned "$BINDIR/$t"; then
+      printf 'install: %s is managed by Homebrew; remove it with brew uninstall\n' "$BINDIR/$t" >&2; failed=1; continue
+    fi
     rm -f -- "$BINDIR/$t" 2>/dev/null
-    if [[ -e $BINDIR/$t ]]; then printf 'install: cannot remove %s\n' "$BINDIR/$t" >&2; failed=1
+    if [[ -e $BINDIR/$t ]]; then printf 'install: cannot remove %s (try: sudo %s --uninstall)\n' "$BINDIR/$t" "$0" >&2; failed=1
     else printf 'Removed %s\n' "$BINDIR/$t"; fi
   done
-  [[ $failed -eq 0 ]] || die "uninstall incomplete (try: sudo $0 --uninstall)"
+  [[ $failed -eq 0 ]] || die "uninstall incomplete"
   [[ $found -eq 1 ]] || printf 'Nothing installed in %s\n' "$BINDIR"
   exit 0
 fi
@@ -86,6 +91,10 @@ fi
 for t in "${TOOLS[@]}"; do
   [[ -f $SRC_DIR/$t ]] || die "missing $t"
   head -n 1 "$SRC_DIR/$t" | grep -q 'bash' || die "$t does not look like the script"
+done
+
+for t in "${TOOLS[@]}"; do
+  brew_owned "$BINDIR/$t" && die "$BINDIR/$t is managed by Homebrew; update with: brew update && brew upgrade git-grove (or install elsewhere with --bindir ~/.local/bin)"
 done
 
 mkdir -p -- "$BINDIR" || die "cannot create $BINDIR"

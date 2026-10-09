@@ -180,5 +180,22 @@ for t in $TOOLS; do check_absent "$BIN/$t"; done
 check_exit $? 0 "uninstall with nothing installed exits 0"
 check_grep "$WORK/t8b.txt" "Nothing installed" "says nothing was installed"
 
+# ---------------------------------------------------------------------------
+section "T9  never touches Homebrew-managed commands"
+BIN5=$WORK/brew/bin
+mkdir -p "$BIN5" "$WORK/brew/Cellar/git-cleanup/1.0.0/bin"
+printf '#!/usr/bin/env bash\necho "git-cleanup 1.0.0"\n' >"$WORK/brew/Cellar/git-cleanup/1.0.0/bin/git-cleanup"
+chmod 0755 "$WORK/brew/Cellar/git-cleanup/1.0.0/bin/git-cleanup"
+ln -s ../Cellar/git-cleanup/1.0.0/bin/git-cleanup "$BIN5/git-cleanup"
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN5" >"$WORK/t9.txt" 2>&1
+check_exit $? 1 "install exits 1 over a Homebrew-managed git-cleanup"
+check_grep "$WORK/t9.txt" "managed by Homebrew" "explains why"
+check_eq "$(readlink "$BIN5/git-cleanup")" ../Cellar/git-cleanup/1.0.0/bin/git-cleanup "Homebrew symlink left alone"
+check_absent "$BIN5/git-grove"
+"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN5" --uninstall >"$WORK/t9u.txt" 2>&1
+check_exit $? 1 "uninstall exits 1 over a Homebrew-managed git-cleanup"
+check_grep "$WORK/t9u.txt" "managed by Homebrew" "uninstall explains why"
+check_eq "$(readlink "$BIN5/git-cleanup")" ../Cellar/git-cleanup/1.0.0/bin/git-cleanup "uninstall leaves the Homebrew symlink"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

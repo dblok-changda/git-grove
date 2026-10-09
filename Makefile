@@ -12,11 +12,11 @@ uninstall:
 	rm -f "$(BINDIR)/git-cleanup"
 
 test:
-	tests/run-tests.sh
+	tests/test-cleanup.sh
 
 # macOS ships bash 3.2 at /bin/bash; the tool must keep working there.
 test-bash3:
-	TEST_BASH=/bin/bash tests/run-tests.sh
+	TEST_BASH=/bin/bash tests/test-cleanup.sh
 
 lint:
-	shellcheck -s bash git-cleanup install.sh tests/run-tests.sh tests/make-fixture.sh
+	shellcheck -s bash git-cleanup install.sh tests/test-cleanup.sh tests/make-fixture.sh

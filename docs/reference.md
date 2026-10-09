@@ -319,7 +319,7 @@ Three lists near the top of `git-cleanup` are meant to be edited:
 `tests/make-fixture.sh <dir>` builds a disposable repository with a bare "remote", a
 clone, about twenty branches and worktrees in every state the tool distinguishes, a
 stash, temp files, generated directories, and a fake `gh` that serves merged-PR
-records. `tests/run-tests.sh` builds fixtures under `$TMPDIR`, runs dry runs with and
+records. `tests/test-cleanup.sh` builds fixtures under `$TMPDIR`, runs dry runs with and
 without `--fetch` and with and without PR data, then drives `--apply` interactively with
 `expect` (declining and accepting prompts, and mutating a branch between audit and
 apply), and asserts the classifications, the files and refs that survive, and the log.

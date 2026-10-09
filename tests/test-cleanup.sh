@@ -4,8 +4,8 @@
 # directory, runs the tool against them with a fake `gh`, and checks every
 # classification plus the effect of --apply. It never touches a real repository.
 #
-#   tests/run-tests.sh                       # bash from PATH
-#   TEST_BASH=/bin/bash tests/run-tests.sh   # e.g. the macOS system bash 3.2
+#   tests/test-cleanup.sh                       # bash from PATH
+#   TEST_BASH=/bin/bash tests/test-cleanup.sh   # e.g. the macOS system bash 3.2
 #
 # Interactive --apply tests need `expect`; they are skipped when it is missing.
 

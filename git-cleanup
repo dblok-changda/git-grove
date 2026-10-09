@@ -17,7 +17,7 @@
 set -u
 set -o pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly RULE="────────────────────────────────────────"
 readonly SEP=$'\x1f'   # field separator for git plumbing output (never appears in ref names)
 

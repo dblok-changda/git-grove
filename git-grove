@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# git-grove — one entry point for a bare-repo + worktree workflow.
+#
+#   git grove init <repo-url> [dir]   clone into a worktree layout   (git-worktree-init)
+#   git grove cleanup [options]       tidy finished branches/worktrees (git-cleanup)
+#
+# Each subcommand is also a standalone command: `git worktree-init`, `git cleanup`.
+
+set -u
+readonly VERSION="1.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage: git grove <command> [args]
+
+Commands:
+  init <repo-url> [dir]   Clone into a bare repo + one worktree per branch
+  cleanup [options]       Audit, and on request remove, finished branches and worktrees
+  help                    Show this help
+
+Run 'git grove <command> -h' for a command's options. The same commands are
+available on their own as 'git worktree-init' and 'git cleanup'.
+
+Options:
+  -h, --help              Show this help
+  --version               Show version
+EOF
+}
+
+# Directory holding this script, following symlinks (Homebrew links bin/ into its Cellar).
+self_dir() {
+  local src=$0 dir
+  while [[ -L $src ]]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    [[ $src == /* ]] || src=$dir/$src
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+run() {
+  local tool=$1 dir
+  shift
+  dir=$(self_dir)
+  if [[ -x $dir/$tool ]]; then exec "$dir/$tool" "$@"; fi
+  if command -v "$tool" >/dev/null 2>&1; then exec "$tool" "$@"; fi
+  printf 'git-grove: cannot find %s\n' "$tool" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  init)           shift; run git-worktree-init "$@" ;;
+  cleanup)        shift; run git-cleanup "$@" ;;
+  help|-h|--help) usage; exit 0 ;;
+  --version)      printf 'git-grove %s\n' "$VERSION"; exit 0 ;;
+  "")             usage >&2; exit 1 ;;
+  *)              printf "git-grove: unknown command '%s' (see 'git grove help')\n" "$1" >&2; exit 1 ;;
+esac

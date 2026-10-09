@@ -1,8 +1,8 @@
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
-SCRIPTS = git-cleanup git-worktree-init
-TESTS = tests/test-init.sh tests/test-cleanup.sh
+SCRIPTS = git-grove git-cleanup git-worktree-init
+TESTS = tests/test-grove.sh tests/test-init.sh tests/test-cleanup.sh
 
 .PHONY: install uninstall test test-bash3 lint
 

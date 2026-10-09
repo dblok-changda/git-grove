@@ -5,7 +5,7 @@ class GitGrove < Formula
   desc "Bare-repo and worktree workflow: set up with init, tidy with cleanup"
   homepage "https://github.com/dblok-changda/git-grove"
   url "https://github.com/dblok-changda/git-grove/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "13035ea644582fa9b87fa2a010bbf5ea04bd6747fad42bf10b10f59bcf5b9412"
   head "https://github.com/dblok-changda/git-grove.git", branch: "main"
 
   depends_on "git"

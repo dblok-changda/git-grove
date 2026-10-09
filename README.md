@@ -65,8 +65,14 @@ This repository used to be `dblok-changda/git-cleanup`, and `git cleanup` works 
 
 - Installed with curl, make, or by hand: nothing breaks. Run the installer above again to
   add `git grove` and `git worktree-init`.
-- Installed with Homebrew: run `brew update`. The `git-cleanup` formula is renamed to
-  `git-grove` and installs all three commands.
+- Installed with Homebrew: the `git-cleanup` formula is now `git-grove` and installs all
+  three commands. Homebrew asks you to trust the renamed formula once, so upgrade with:
+
+  ```bash
+  brew update
+  brew trust --formula dblok-changda/git-cleanup/git-grove
+  brew upgrade git-grove
+  ```
 
 ## git grove init
 

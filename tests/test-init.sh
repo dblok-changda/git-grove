@@ -2,10 +2,10 @@
 #
 # Self-test for git-worktree-init. Builds disposable "remote" repositories in a temporary
 # directory, runs the tool against them over file:// URLs, and checks the resulting
-# layout plus the installer. It never touches the network or a real repository.
+# layout. It never touches the network or a real repository.
 #
-#   tests/run-tests.sh                       # bash from PATH
-#   TEST_BASH=/bin/bash tests/run-tests.sh   # e.g. the macOS system bash 3.2
+#   tests/test-init.sh                       # bash from PATH
+#   TEST_BASH=/bin/bash tests/test-init.sh   # e.g. the macOS system bash 3.2
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P)
@@ -119,24 +119,6 @@ check_grep <(printf '%s\n' "$out") '^Usage: ' "--help prints usage"
 "$BASH_BIN" "$GWI" >/dev/null 2>&1; check_exit $? 1 "no arguments exits 1"
 "$BASH_BIN" "$GWI" --bogus >/dev/null 2>&1; check_exit $? 1 "unknown option exits 1"
 "$BASH_BIN" "$GWI" a b c >/dev/null 2>&1; check_exit $? 1 "too many arguments exits 1"
-
-# ---------------------------------------------------------------------------
-section "T5  installer"
-BIN=$WORK/bin
-"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" >"$WORK/t5.txt" 2>&1
-check_exit $? 0 "install.sh exits 0"
-if [[ -x $BIN/git-worktree-init ]]; then ok "installed executable"; else bad "not installed or not executable"; fi
-check_grep "$WORK/t5.txt" 'Installed .*git-worktree-init \(git-worktree-init [0-9.]+\)' "reports installed version"
-check_eq "$(PATH="$BIN:$PATH" git worktree-init --version 2>&1)" "$("$BASH_BIN" "$GWI" --version)" "available as 'git worktree-init'"
-chmod 0555 "$BIN"
-"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" --uninstall >"$WORK/t5u.txt" 2>&1
-check_exit $? 1 "--uninstall exits 1 when the file cannot be removed"
-check_grep "$WORK/t5u.txt" "cannot remove" "explains why"
-check_present "$BIN/git-worktree-init"
-chmod 0755 "$BIN"
-"$BASH_BIN" "$ROOT/install.sh" --bindir "$BIN" --uninstall >/dev/null 2>&1
-check_exit $? 0 "install.sh --uninstall exits 0"
-check_absent "$BIN/git-worktree-init"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
